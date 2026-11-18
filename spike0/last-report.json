@@ -1,0 +1,66 @@
+{
+  "at": "2026-11-16T04:43:56.910Z",
+  "node": "v22.22.2",
+  "platform": "darwin-arm64",
+  "adapter": "mock",
+  "results": [
+    {
+      "id": "mount",
+      "title": "插件可被宿主加载（apply 返回成功）",
+      "state": "PASS",
+      "detail": "steps=cordis.ctx>adapter>listen>lifecycle",
+      "blocking": true
+    },
+    {
+      "id": "listen-loopback",
+      "title": "监听地址为回环",
+      "state": "PASS",
+      "detail": "127.0.0.1:3291",
+      "blocking": true
+    },
+    {
+      "id": "listen-loopback",
+      "title": "同网段不可达（默认零暴露）",
+      "state": "PASS",
+      "detail": "192.168.3.248 连接被拒",
+      "blocking": true
+    },
+    {
+      "id": "host-info",
+      "title": "取得 hostVersion 与能力集",
+      "state": "PASS",
+      "detail": "v0.11.1 caps=8 adapter=mock",
+      "blocking": true
+    },
+    {
+      "id": "host-info",
+      "title": "连接的是真实宿主（非 Mock）",
+      "state": "WARN",
+      "detail": "当前为 mock 适配器：本项必须在真机复核",
+      "blocking": false
+    },
+    {
+      "id": "mux-read",
+      "title": "真实 mux 只读方法",
+      "state": "SKIP",
+      "detail": "mock 适配器不涉及 mux；真机复跑时用 --host=mux",
+      "blocking": false
+    },
+    {
+      "id": "port-release",
+      "title": "停止后端口释放（无孤儿监听）",
+      "state": "PASS",
+      "detail": "3291 已关闭",
+      "blocking": true
+    },
+    {
+      "id": "isolation",
+      "title": "插件异常不外抛（防带崩宿主）",
+      "state": "PASS",
+      "detail": "宿主 effect 抛错",
+      "blocking": true
+    }
+  ],
+  "verdict": "PASS",
+  "blockingFailed": []
+}

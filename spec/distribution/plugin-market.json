@@ -1,0 +1,50 @@
+{
+  "$note": "DSH 原生『发现 → 添加索引源』format 1 索引模板。发布前把三处 <占位> 替换为真实值：GitHub 仓库地址、首次发布的完整 commit、publishTimestamp（Unix 秒）。宿主管线要求 source 固定到完整 commit；此文件随每次插件发版更新 versions 数组（最新一条在最前）。托管：GitHub Pages（仓库直出）或 matrixboard.cn 静态目录。",
+  "format": 1,
+  "title": {
+    "en": "DSH Mobile Companion",
+    "zh": "DSH 移动伴侣插件源"
+  },
+  "description": {
+    "en": "Companion gateway that pairs an iPhone with the desktop DeepSeek Harness: tasks, artifacts and sessions on the phone, over LAN or a fixed public domain (Cloudflare Tunnel).",
+    "zh": "把 iPhone 与桌面 DeepSeek Harness 配对成移动伴侣：待办、成果物与会话随身走。局域网直连与 Cloudflare Tunnel 固定域名双通道并存，扫码即连。"
+  },
+  "metadata": {
+    "labels": {
+      "dsh-install-check": {
+        "title": {
+          "en": "DSH install check",
+          "zh": "由 DSH 最终检查"
+        }
+      }
+    }
+  },
+  "plugins": [
+    {
+      "name": "dsh-mobile-ios",
+      "title": "DSH iOS移动伴侣",
+      "description": "iPhone 侧移动伴侣网关：桌面侧栏一键生成配对码，手机扫码后可查看/续跑会话、处理待办与成果物。局域网（同一 Wi-Fi）与远程固定域名（Cloudflare Tunnel，一机一址）两种连接方式并存；管理面仅限主机本机，业务面走设备凭证。",
+      "author": "yelter",
+      "homepage": "https://github.com/yelter/dsh-mobile-ios",
+      "repository": {
+        "url": "https://github.com/yelter/dsh-mobile-ios"
+      },
+      "metadata": {
+        "labels": [
+          "dsh-install-check"
+        ]
+      },
+      "versions": [
+        {
+          "version": "0.2.1",
+          "publishTimestamp": 0,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/yelter/dsh-mobile-ios",
+            "commit": "<占位-完整40位commit>"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "name": "dsh-mobile-ios",
+  "version": "0.2.1",
+  "type": "module",
+  "description": "DSH iOS移动伴侣：iPhone/iPad 扫码连接 DSH 桌面端，局域网直连 + Cloudflare Tunnel 固定域名远程两种通道",
+  "main": "entries/plugin.mjs",
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.1-alpha.4"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "dsh",
+    "ios",
+    "mobile-companion",
+    "pairing"
+  ],
+  "license": "MIT",
+  "files": [
+    "entries/",
+    "lib/",
+    "src/",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node entries/sidecar.mjs --host=mock --dev",
+    "start:lan": "node entries/sidecar.mjs --host=mock --dev --lan=true",
+    "probe": "node spike0/probe.mjs",
+    "test": "node test/selftest.mjs && node test/ops.mjs && node test/resilience.mjs && node test/borrowed.mjs && node test/mux-table.mjs && node test/live-frames.mjs && node test/artifacts.mjs && node test/attachments.mjs && node test/session-actions.mjs && node test/enhance.mjs && node test/tunnel-named.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "exports": {
+    ".": {
+      "default": "./entries/plugin.mjs"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  }
+}
