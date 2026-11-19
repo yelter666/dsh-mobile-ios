@@ -4,6 +4,7 @@
   "type": "module",
   "description": "DSH iOS移动伴侣：iPhone/iPad 扫码连接 DSH 桌面端，局域网直连 + Cloudflare Tunnel 固定域名远程两种通道",
   "main": "entries/plugin.mjs",
+  "icon": "assets/brand/plugin-icon.png",
   "engines": {
     "node": ">=20",
     "dsh": ">=0.2.1-alpha.4"
@@ -17,6 +18,7 @@
   ],
   "license": "MIT",
   "files": [
+    "assets/",
     "entries/",
     "lib/",
     "src/",
