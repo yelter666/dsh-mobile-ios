@@ -184,9 +184,13 @@ c2.close();
 
 const t3 = (await httpJson({ port, method: 'POST', path: '/mobile/v1/ws-ticket', token })).body.ticket;
 const c3 = await connect({ port, protocols: ['dsh.v1', `ticket.${t3}`] });
-c3.send({ t: 'hello', protocolVersion: '1.0', caps: ['tasks.read'], deviceId, installId: 'ins_test' });
+const fullDeviceName = '李大葉的 iPhone 17 Pro Max（工作机）';
+c3.send({ t: 'hello', protocolVersion: '1.0', caps: ['tasks.read'], deviceId, installId: 'ins_test', deviceName: fullDeviceName });
 const ready = await c3.until((j) => j?.t === 'ready');
 check('握手成功且 ready 含 gen/caps', Boolean(ready.json?.gen) && Array.isArray(ready.json?.caps), JSON.stringify(ready.json));
+const renamedSummary = await httpJson({ port, path: '/mobile/v1/desktop/summary' });
+check('hello 全称已同步到桌面设备清单', renamedSummary.body?.pairing?.devices?.some((d) => d.deviceName === fullDeviceName),
+  JSON.stringify(renamedSummary.body?.pairing?.devices));
 const genFirst = ready.json.gen;
 
 // ---- 7. 事件流与 seq ----
@@ -234,9 +238,9 @@ c4.close();
   check('第二台设备配对成功', secondRedeem.status === 200, JSON.stringify(secondRedeem.body));
   const devicesSummary = await httpJson({ port, path: '/mobile/v1/desktop/summary' });
   const devices = devicesSummary.body?.pairing?.devices ?? [];
-  check('摘要列出两台设备并显示真实名称',
+  check('摘要列出两台设备并显示关于页全称',
         devices.length === 2 && devices.some((d) => d.deviceName === 'iPad mini')
-        && devices.some((d) => d.deviceName === 'iPhone 17 Pro'), JSON.stringify(devices));
+        && devices.some((d) => d.deviceName === fullDeviceName), JSON.stringify(devices));
   check('摘要不泄露设备凭证哈希',
         devices.every((d) => !('deviceTokenHash' in d) && !('installId' in d)), JSON.stringify(devices));
   check('活跃设备数正确', devicesSummary.body?.pairing?.activeDevices === 2);

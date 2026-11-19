@@ -113,6 +113,7 @@ console.log('\n▶ 借鉴：设备注册表持久化');
   const logA = [];
   const a = new PairingService({ log: (m) => logA.push(m), file });
   const issued = a.issueCode({ deviceName: '持久化测试' });
+  check('配对码有效期 120 秒', issued.expiresInSec === 120, String(issued.expiresInSec));
   const redeemed = a.redeem({ code: issued.code, installId: 'ins_persist', deviceName: '持久化测试' });
 
   const stat = fs.statSync(file);
@@ -139,6 +140,22 @@ console.log('\n▶ 借鉴：设备注册表持久化');
   } catch (err) {
     check('撤销状态跨重启保留（4009）', err.code === 4009, `code=${err.code}`);
   }
+}
+
+// ---- 设备名称：hello 上报的「关于」页全称覆盖配对时的初始名 ----
+console.log('\n▶ 设备名称：全称同步且不截断');
+{
+  const file = path.join(tmpRoot, 'devices-rename.json');
+  const svc = new PairingService({ log: () => {}, file });
+  const issued = svc.issueCode({ deviceName: 'desktop-sidebar' });
+  const redeemed = svc.redeem({ code: issued.code, installId: 'ins_rename', deviceName: 'desktop-sidebar' });
+  const fullName = '李大葉的 iPhone 17 Pro Max（工作机）';
+  check('hello 全称覆盖初始名', svc.renameDevice(redeemed.deviceId, fullName) === true);
+  check('清单展示完整名称', svc.listDevices()[0].deviceName === fullName, svc.listDevices()[0].deviceName);
+  check('空名不改已有名称', svc.renameDevice(redeemed.deviceId, '   ') === false);
+  check('重启后仍是全称', new PairingService({ log: () => {}, file }).listDevices()[0].deviceName === fullName);
+  svc.revokeDevice(redeemed.deviceId);
+  check('撤销后不接受改名', svc.renameDevice(redeemed.deviceId, '别的名字') === false);
 }
 
 // ---- 5. 设备上限与同机去重 ----

@@ -251,6 +251,11 @@ export function attachWebSocket(server, { core, pairing, tickets, log = () => {}
           clearTimeout(helloTimer);
           try {
             core.handleHello(session, msg);
+            // hello 已通过凭证校验：把客户端「关于」页当前的设备名全称同步到注册表，
+            // 面板下一次刷新即可看到改名后的名字（配对时记下的名字只是初始值）。
+            if (typeof msg.deviceName === 'string') {
+              pairing.renameDevice(session.device.deviceId, msg.deviceName);
+            }
           } catch (err) {
             rejectAndClose(err);
           }

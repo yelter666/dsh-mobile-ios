@@ -1,6 +1,6 @@
 // pairing.mjs — 配对与设备凭证（GW-4 / GW-7）
 // 安全约束（不可放松）：
-//   · 配对码 6 位数字、TTL 300s、单次有效、生成 5 次/分钟；
+//   · 配对码 6 位数字、TTL 120s、单次有效、生成 5 次/分钟；
 //   · 错 5 次锁定 60s，且锁定期间不泄露"码对不对"；
 //   · 凭证只存哈希，内存里不保留明文副本；
 //   · 撤销是"整设备"语义，客户端收到 4009 必须清本地凭证并停止重连。
@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fail } from './protocol.mjs';
 
-const CODE_TTL_SEC = 300;
+const CODE_TTL_SEC = 120;
 const CODE_MAX_ATTEMPTS = 5;
 const CODE_RATE_LIMIT = 5;
 const CODE_RATE_WINDOW_MS = 60_000;
@@ -253,12 +253,28 @@ export class PairingService {
       .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
       .map((d) => ({
         deviceId: d.deviceId,
-        deviceName: d.deviceName || d.deviceId,
+        deviceName: d.deviceName || '未命名设备',
         platform: d.platform,
         appVersion: d.appVersion,
         createdAt: d.createdAt,
         expiresAt: d.expiresAt,
       }));
+  }
+
+  /**
+   * 已认证设备在 WS hello 时回报「关于 → 设备名称」全称，立即覆盖配对时记下的名字。
+   * 名字来自设备自身，服务端不截短、不改写；空值忽略，撤销设备不接受改名。
+   */
+  renameDevice(deviceId, name) {
+    if (typeof name !== 'string') return false;
+    const clean = name.trim();
+    if (!clean) return false;
+    const device = this.byDeviceId.get(String(deviceId || ''));
+    if (!device || device.revoked || device.deviceName === clean) return false;
+    device.deviceName = clean;
+    this.#persist();
+    this.log(`pair  更新设备名 device=${device.deviceId} name=${clean}`);
+    return true;
   }
 
   /** 单设备下线：设备下次带旧凭证请求会收到 4009 并清本地凭证。 */
