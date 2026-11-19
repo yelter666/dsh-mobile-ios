@@ -31,13 +31,17 @@ function discoverCloudflared() {
       .filter((v) => !v.startsWith('.'))
       .sort()
       .reverse();
+    // Windows 组件目录里的可执行文件名带 .exe；先按平台列候选，命中即用。
+    const binNames = process.platform === 'win32' ? ['cloudflared.exe', 'cloudflared'] : ['cloudflared'];
     for (const v of versions) {
-      const bin = path.join(dir, v, 'cloudflared');
-      try {
-        fs.accessSync(bin, fs.constants.X_OK);
-        return bin;
-      } catch {
-        /* 版本目录里没有可执行文件，继续 */
+      for (const binName of binNames) {
+        const bin = path.join(dir, v, binName);
+        try {
+          fs.accessSync(bin, fs.constants.X_OK);
+          return bin;
+        } catch {
+          /* 版本目录里没有该可执行文件，继续 */
+        }
       }
     }
   } catch {
@@ -127,7 +131,9 @@ export function apply(ctx = {}, config = {}) {
     const common = {
       baseDomain,
       prefix: tunnelCfg.prefix || 'dsh',
-      executable: cloudflareBin === 'auto' ? 'cloudflared' : cloudflareBin,
+      executable: cloudflareBin === 'auto'
+        ? (process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared')
+        : cloudflareBin,
     };
     const explicit = tunnelCfg.provisioner ? String(tunnelCfg.provisioner) : null;
     const apiToken = tunnelCfg.apiToken || process.env.DSH_CF_API_TOKEN;

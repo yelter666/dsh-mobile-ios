@@ -8,10 +8,38 @@ DSH Mobile iOS 是 DSH Moblie 项目的桌面端插件与 iOS移动伴侣 App �
 
 ## 安装
 
-在 DSH 桌面端：**插件 → 添加插件**，填包名 `dsh-mobile-ios`，安装源选
-npm 官方源（registry.npmjs.org）或中国大陆镜像源（registry.npmmirror.com），
-点安装即可；也可以粘贴本仓库地址或选择本地插件目录安装。装好后桌面侧栏
-左下角出现「📱 iOS移动伴侣」入口，点开即可生成配对码，iPhone App 扫码连接。
+在 DSH 桌面端：**插件 → 添加插件**，输入框填包名 `dsh-mobile-ios`，点安装即可。
+输入框接受的就是 **npm 包名**（也可带版本，如 `dsh-mobile-ios@0.2.1`）、Git 仓库
+地址或本地插件目录路径。安装源展开后可选：
+
+- **npm 官方源** `registry.npmjs.org`
+- **中国大陆镜像源** `registry.npmmirror.com`
+- **自定义地址**（内网/私有源，凭据放本机 `~/.npmrc`）
+
+首次未显式选源时，DSH 会并发探测官方源与镜像源的 `/–/ping`，自动选最先响应的那个。
+安装前 DSH 会先 `pluginManager.inspect` 校验包名与 bundle patch（本包带
+`cordis.patch.yml`，校验可过），再按所选源安装。装好后桌面侧栏左下角出现
+「📱 iOS移动伴侣」入口，点开即可生成配对码，iPhone App 扫码连接。
+
+> 尚未发布到 npm 时，用 Git 地址 `https://github.com/yelter666/dsh-mobile-ios`
+> 或本地目录路径安装；发布后直接用包名即可。
+
+### 更新
+
+插件面板右上角的「插件更新」会读 npm registry 的 `latest` 与当前版本比对：
+
+- npm 已发布且有新版：提示到插件页**卸载后重新安装**（或输 `dsh-mobile-ios@版本号`
+  更新）——DSH 对非官方按需插件的升级方式是"删除已装包再按相同选择重装"；
+- 尚未发布（registry 返回 404）：如实提示当前为本地开发版，更新方式为
+  `git pull` 后重启 DSH 桌面端，插件随源码热重载；
+- 网络不可达：如实报不可达，不假装已是最新。
+
+### Windows 注意
+
+远程通道依赖外部可执行文件 `cloudflared`（**不含在本包内**，插件本体纯 JS 双平台通用）。
+Windows 上请下载 `cloudflared.exe` 加入 PATH，或设 `CLOUDFLARED_BIN` 指向它；
+macOS 用 `brew install cloudflared`。未安装时插件如实隐藏远程入口并给出对应平台指引，
+不会伪装可用；局域网通道不依赖 cloudflared，任何平台开箱即用。
 
 ---
 
@@ -23,7 +51,7 @@ npm 官方源（registry.npmjs.org）或中国大陆镜像源（registry.npmmirr
 - **产物列表**：任务生成的文件卡片（名称 / 类型 / 体积），事件流实时推送；
 - **桌面端侧栏入口**：左下角「iOS移动伴侣」banner——连接状态点、网关摘要（适配器 / 已配对设备 / 隧道）、一键生成配对码；
 - **多种通道**：局域网直连（secure-by-default，默认只听回环）+ cloudflared Quick Tunnel（自动重拉 + 地址漂移广播）；
-- **凭证安全**：设备凭证存 iOS 钥匙串；配对码 5 分钟有效、限速防爆破、可全量撤销；
+- **凭证安全**：设备凭证存 iOS 钥匙串；配对码 2 分钟有效、限速防爆破、可全量撤销；
 - **崩溃隔离（R12）**：网关端口冲突自动顺延（3081–3085），隧道崩溃自动重启，插件 apply 永不向宿主抛异常。
 
 ## 快速开始
@@ -40,7 +68,7 @@ dsh plugin --profile desktop add /path/to/dsh-mobile-ios
 ### 2. 连接 iPhone（局域网）
 
 1. 电脑与手机连上**同一 Wi-Fi**；
-2. 点侧栏「iOS移动伴侣」→ 面板内 **生成配对码**（6 位数字，约 5 分钟有效）；
+2. 点侧栏「iOS移动伴侣」→ 面板内 **生成配对码**（6 位数字，约 2 分钟有效）；
 3. iPhone 打开 DSH App → 连接 → 输入电脑地址（`局域网IP:端口`，端口见面板「网关地址」行）与配对码；
 4. 首次连接 iOS 会请求「本地网络」权限，请点**允许**。
 

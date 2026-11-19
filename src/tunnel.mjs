@@ -231,8 +231,11 @@ export class TunnelManager {
     if (!exe) {
       this.state = 'failed';
       this.error = '主机未安装 cloudflared';
+      const installHint = process.platform === 'win32'
+        ? '下载 cloudflared.exe 加入 PATH（或设置 CLOUDFLARED_BIN 指向它）'
+        : '在主机执行 `brew install cloudflared`，或设置 CLOUDFLARED_BIN 指向可执行文件';
       const err = fail(4021, '主机未安装 cloudflared，无法开启隧道', {
-        detail: '在主机执行 `brew install cloudflared`，或设置 CLOUDFLARED_BIN 指向可执行文件',
+        detail: installHint,
       });
       throw err;
     }
