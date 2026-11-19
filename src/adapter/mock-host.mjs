@@ -153,6 +153,7 @@ export function createMockHost({ fixturesDir = DEFAULT_FIXTURES, log = () => {},
         budget: { limitMin: t.budgetMin ?? 10, usedSec: t.elapsedSec ?? 0, remainingSec: 600, warnAt: 480 },
         pendingTodos: [],
         artifactsPreview: [],
+        tokenUsage: null,
         lastSeq: 0,
         serverTime: new Date().toISOString(),
       };

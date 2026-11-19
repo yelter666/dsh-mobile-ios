@@ -97,7 +97,7 @@ const DESKTOP_CORS_PATHS = [
   /^\/mobile\/v1\/tunnel\/provision$/,
 ];
 
-const GATEWAY_VERSION = '0.2.0-spike0';
+const GATEWAY_VERSION = '0.2.1';
 
 function readJson(req) {
   return new Promise((resolve, reject) => {

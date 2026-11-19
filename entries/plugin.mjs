@@ -16,7 +16,7 @@ import { createCordisHost } from '../src/adapter/cordis-host.mjs';
 import { createProvisioner } from '../src/cloudflare.mjs';
 
 export const name = 'dsh-mobile-ios';
-export const version = '0.2.0-spike0';
+export const version = '0.2.1';
 
 /**
  * 本机 cloudflared 发现链：config.tunnelBin → env CLOUDFLARED_BIN（tunnel.mjs 处理）

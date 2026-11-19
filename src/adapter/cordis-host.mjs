@@ -114,6 +114,65 @@ function deriveTitle(summary) {
  *
  * needsYou/pendingTodoCount v1 恒 false/0：宿主 summary 不暴露审批态，不编造。
  */
+/**
+ * 从会话事件推导「最近一轮」的 token 用量。
+ *
+ * 宿主的权威字段取自 app.asar 实证：`assistant/message` 的 `data.usage`
+ * （或 stream 里最后一段 usage），形状是
+ * `{ inputTokens, outputTokens, totalTokens, cacheReadTokens, cacheWriteTokens }`。
+ * 同一轮可能有多次尝试（step），每个 step 取最后一次采样，跨 step 求和——
+ * 与宿主 `dsh-token-meter/turn-usage.ts` 的 deriveTurnTokenUsage 同口径。
+ * 拿不到就返回 null：面板只能如实省略，不能编一个数字。
+ */
+function latestTurnUsage(records) {
+  const events = (Array.isArray(records) ? records : [])
+    .map((r) => r?.event ?? r)
+    .filter((e) => e && typeof e === 'object');
+  let endIdx = -1;
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    if (events[i].type === 'turn/end') { endIdx = i; break; }
+  }
+  if (endIdx < 0) return null;
+  const turn = events[endIdx].data?.turn;
+  let startIdx = 0;
+  if (turn !== undefined) {
+    for (let i = endIdx - 1; i >= 0; i -= 1) {
+      if (events[i].type === 'turn/start' && events[i].data?.turn === turn) { startIdx = i; break; }
+    }
+  }
+  const isCount = (v) => typeof v === 'number' && Number.isFinite(v) && v >= 0;
+  const streamUsage = (stream) => {
+    if (!Array.isArray(stream)) return null;
+    for (let i = stream.length - 1; i >= 0; i -= 1) {
+      if (stream[i]?.usage && isCount(stream[i].usage.inputTokens)) return stream[i].usage;
+    }
+    return null;
+  };
+  const samples = new Map();
+  for (let i = startIdx; i <= endIdx; i += 1) {
+    const e = events[i];
+    if (e.type !== 'assistant/message') continue;
+    const d = e.data ?? {};
+    const u = d.usage ?? streamUsage(d.stream);
+    if (!isCount(u?.inputTokens) || !isCount(u?.outputTokens)) continue;
+    samples.set(String(d.step ?? '0'), u);
+  }
+  if (!samples.size) return null;
+  let totalTokens = 0;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheReadTokens = 0;
+  let cacheWriteTokens = 0;
+  for (const u of samples.values()) {
+    inputTokens += u.inputTokens;
+    outputTokens += u.outputTokens;
+    totalTokens += isCount(u.totalTokens) ? u.totalTokens : u.inputTokens + u.outputTokens;
+    if (isCount(u.cacheReadTokens)) cacheReadTokens += u.cacheReadTokens;
+    if (isCount(u.cacheWriteTokens)) cacheWriteTokens += u.cacheWriteTokens;
+  }
+  return { totalTokens, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens };
+}
+
 function summaryToTask(summary, hostName, workspaceIndex = null) {
   const running = summary.running === true;
   const workspace = workspaceIndex?.bySession.get(String(summary.sessionId));
@@ -711,6 +770,10 @@ export function createCordisHost({ ctx, log = () => {}, hostname = os.hostname()
         const artifacts = await taskArtifacts(taskId).catch(() => ({ items: [] }));
         const items = artifacts.items ?? [];
         task.artifactsCount = items.length;
+        // token 用量与产物同源（会话事件）；宿主没给就 null，手机端省略而不是编造。
+        const tokenUsage = await eventPage(taskId, { maxMessages: 80 })
+          .then((page) => latestTurnUsage(page.records))
+          .catch(() => null);
         return {
           task,
           // budget/pendingTodos 如实缺省（iOS 端全部可选解码）；
@@ -719,6 +782,7 @@ export function createCordisHost({ ctx, log = () => {}, hostname = os.hostname()
           // 预览带前 12 条即可：手机上「对话里提到的」通常就是最近这几个，
           // 完整清单仍由产物面板按需拉。
           artifactsPreview: items.slice(0, 12),
+          tokenUsage,
           lastSeq: 0,
           serverTime: new Date().toISOString(),
         };
