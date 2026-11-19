@@ -4,7 +4,7 @@
 
 DSH Mobile iOS 是 DSH Moblie 项目的桌面端插件与 iOS移动伴侣 App 的组合：插件在电脑端提供移动网关（REST + WebSocket），iPhone App 通过局域网或隧道配对连接，实时查看任务进度、追加指令、审批待办、查看产物。桌面端侧栏左下角有「**iOS移动伴侣**」入口，点开即见连接状态与配对码。
 
-> 本插件与社区的 [dsh-mobile](https://github.com/saya-ch/dsh-mobile)（Android 伴侣）定位互补、互不冲突：它走**原生 iOS App** 路线，面向 iPhone 优化（SwiftUI 原生界面、钥匙串凭证、系统通知），而不是移动网页布局适配。
+面向 iPhone / iPad 采用 **SwiftUI 原生界面**：钥匙串凭证、系统通知、双栏自适应，而非移动网页布局适配。
 
 ## 安装
 
@@ -21,8 +21,8 @@ DSH Mobile iOS 是 DSH Moblie 项目的桌面端插件与 iOS移动伴侣 App �
 `cordis.patch.yml`，校验可过），再按所选源安装。装好后桌面侧栏左下角出现
 「📱 iOS移动伴侣」入口，点开即可生成配对码，iPhone App 扫码连接。
 
-> 尚未发布到 npm 时，用 Git 地址 `https://github.com/yelter666/dsh-mobile-ios`
-> 或本地目录路径安装；发布后直接用包名即可。
+> 本包已发布至 npm：`https://www.npmjs.com/package/dsh-mobile-ios`。
+> 也可粘贴仓库地址 `https://github.com/yelter666/dsh-mobile-ios` 或本地目录路径安装。
 
 ### 更新
 
@@ -30,8 +30,8 @@ DSH Mobile iOS 是 DSH Moblie 项目的桌面端插件与 iOS移动伴侣 App �
 
 - npm 已发布且有新版：提示到插件页**卸载后重新安装**（或输 `dsh-mobile-ios@版本号`
   更新）——DSH 对非官方按需插件的升级方式是"删除已装包再按相同选择重装"；
-- 尚未发布（registry 返回 404）：如实提示当前为本地开发版，更新方式为
-  `git pull` 后重启 DSH 桌面端，插件随源码热重载；
+- 本地 link 安装的开发态（读不到 registry 版本）：提示 `git pull` 后重启 DSH
+  桌面端，插件随源码热重载；
 - 网络不可达：如实报不可达，不假装已是最新。
 
 ### Windows 注意
@@ -58,8 +58,10 @@ macOS 用 `brew install cloudflared`。未安装时插件如实隐藏远程入�
 
 ### 1. 安装插件（DSH Desktop）
 
+普通用户直接用上文「安装」里的包名方式即可。开发态想从源码加载：
+
 ```bash
-# 在桌面端 profile 注册本 bundle（安装后重启 DSH 生效）
+# 在桌面端 profile 注册本地 bundle（改源码后重启 DSH 生效）
 dsh plugin --profile desktop add /path/to/dsh-mobile-ios
 ```
 
@@ -160,7 +162,7 @@ gateway/                     # 包名 dsh-mobile-ios（插件标识）
     └── mux-table.mjs       X2 方法表验收（32 断言）
 ```
 
-## 2. 六条命令
+## 2. 开发命令
 
 ```bash
 # ① 起服务（mock 宿主，附带开箱可用的配对码）
@@ -168,7 +170,7 @@ node entries/sidecar.mjs --host=mock --dev
 #    REST  http://127.0.0.1:3081/mobile/v1/health
 #    WS    ws://127.0.0.1:3081/ws/mobile
 
-# ② 全量契约测试（11 套件 505 断言）
+# ② 全量契约测试（11 套件 532 断言）
 npm test
 
 # ③ Spike-0 六项验收（本机）
@@ -220,12 +222,12 @@ bash spike0/run-demo.sh            # 自动起服务 → 造 3 帧 → 跑客户
 
 | 项 | 结果 |
 |---|---|
-| `npm test`（11 套件） | **505 通过 / 0 失败**（自检 58 + 运维 41 + 韧性 29 + 借鉴 39 + mux 方法表 53 + 隧道 148 + 帧/产物/附件/增强/会话动作等） |
+| `npm test`（11 套件） | **532 通过 / 0 失败**（自检 67 + 运维 44 + 韧性 29 + 借鉴 54 + mux 方法表 53 + 隧道 148 + 帧/产物/附件/增强/会话动作等） |
 | `node spike0/probe.mjs`（mock） | **PASS**，6 项阻塞全过；真宿主与 mux 两项目标为 WARN/SKIP（不假装通过） |
 | `node spike0/probe.mjs --host=mux`（不可达） | **FAIL**，如实报「宿主降级」与 `status=0`，不是假绿 |
 | X1 宿主挂载 | **已验证**（2026-11-16）：desktop profile bundle 加载，127.0.0.1:3081 服务，/health + 配对码 + 4001 鉴权 |
 | X2 方法表 | **已落地**：`cordis-host.mjs` 进程内适配器 + 32 断言；真宿主对照 diag 待验 |
-| iOS 端到端（`ios/DSHMobileKit`） | **439 / 439** 全绿（Kit spike）+ 模拟器真跑截图链路 |
+| iOS 端到端（`ios/DSHMobileKit`） | **634 / 634** 全绿（Kit spike）+ 模拟器真跑截图链路 |
 
 韧性验收覆盖的关键行为：异常断链后按游标续传（1..7 零丢失零重复）、缺口时 `gap=true` 且 `resumeFrom` 指向真实下界、宿主重启后旧 gen 握手被要求全量重建（`gap=true/resumed=0`）而新 gen 不误报、重启后 seq 从 1 重开、幂等窗口不随重启失效（`duplicate=true`）。
 
@@ -276,6 +278,7 @@ bash spike0/run-demo.sh            # 自动起服务 → 造 3 帧 → 跑客户
 ## 10. 下一步
 
 1. **X2 真宿主实跑**：desktop profile 的 `cordis.patch.yml` 打开 `host: mux` 重启，对照 diag 服务可见性。
-2. 真机装 `brew install cloudflared` 后，把 `--tunnel-bin` 指向真实可执行文件复跑 `test/ops.mjs`，
-   确认解析逻辑与真实输出格式一致（当前用假脚本验证的是格式契约，不是真实二进制）。
+2. 真机安装 cloudflared 后（macOS `brew install cloudflared`；Windows 下载 `cloudflared.exe`
+   加入 PATH），把 `--tunnel-bin` 指向真实可执行文件复跑 `test/ops.mjs`，确认解析逻辑与真实
+   输出格式一致（当前用假脚本验证的是格式契约，不是真实二进制）。
 3. iOS 界面层持续完善（连接指引页 / 附件契约升级 / 模型选择宿主映射）。
