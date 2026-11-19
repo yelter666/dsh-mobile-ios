@@ -45,6 +45,27 @@ console.log('\n▶ 隧道：未安装 cloudflared');
   check('状态里标明可执行文件缺失', tunnel.status().executable === 'missing');
 }
 
+// ---- 1b. 缺失提示按平台给不同安装指引（macOS brew / Windows exe）----
+console.log('\n▶ 隧道：缺失提示按平台分流');
+{
+  const realPlatform = process.platform;
+  const setPlatform = (p) => Object.defineProperty(process, 'platform', { value: p, configurable: true });
+  const detailFor = async (platform) => {
+    setPlatform(platform);
+    const t = new TunnelManager({ port: 3199, executable: '/nonexistent/cloudflared' });
+    try { await t.start(); return ''; } catch (e) { return String(e.extra?.detail || ''); }
+  };
+  try {
+    const mac = await detailFor('darwin');
+    check('macOS 提示含 brew install', mac.includes('brew install cloudflared'), mac);
+    const win = await detailFor('win32');
+    check('Windows 提示含 .exe 与 PATH', win.includes('cloudflared.exe') && win.includes('PATH'), win);
+    check('Windows 提示不再误导用 brew', !win.includes('brew install'), win);
+  } finally {
+    setPlatform(realPlatform);
+  }
+}
+
 // ---- 2. TunnelManager：启动 / 幂等 / 地址漂移 / 回收 ----
 console.log('\n▶ 隧道：启动、幂等与地址漂移');
 let liveTunnel = null;
