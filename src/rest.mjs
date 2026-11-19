@@ -251,6 +251,9 @@ export function createRestRouter({ core, pairing, host, tickets, config = {}, lo
     const info = host.info();
     const stats = core.stats();
     const tunnel = tunnelSnapshot();
+    const connected = new Set(typeof core.connectedDeviceIds === 'function' ? core.connectedDeviceIds() : []);
+    // 面板要能点开看设备名并逐台下线：这里只给展示字段，绝不带凭证哈希/installId。
+    const devices = pairing.listDevices().map((d) => ({ ...d, online: connected.has(d.deviceId) }));
     return send(ctx.res, 200, {
       ok: true,
       version: GATEWAY_VERSION,
@@ -258,7 +261,12 @@ export function createRestRouter({ core, pairing, host, tickets, config = {}, lo
       hostName: info.hostName,
       // 手机端应填的局域网地址（IP:port）；null 表示网关未绑公网/私网面或未就绪
       lan: config.lanAddr?.() ?? null,
-      pairing: { activeDevices: stats.pairing.activeDevices },
+      pairing: {
+        activeDevices: stats.pairing.activeDevices,
+        maxDevices: pairing.maxDevices,
+        onlineDevices: connected.size,
+        devices,
+      },
       sessions: { ready: stats.readySessions },
       tunnel,
       uptimeSec: stats.uptimeSec,
@@ -343,6 +351,28 @@ export function createRestRouter({ core, pairing, host, tickets, config = {}, lo
       protocolVersion: '1.0',
       caps: info.caps,
     });
+  });
+
+  /**
+   * 单设备下线（桌面面板「已配对设备」里逐台操作）。
+   * 与全量 revoke 同样的管理面约束：只允许本机回环 + 同机 Origin；
+   * 面板没有 Bearer，所以不调 auth()——防的是同网段设备，不是本机用户。
+   * 撤销同时掐断该设备的 WS，避免旧连接在会话存活期间继续读任务数据。
+   */
+  route('POST', /^\/mobile\/v1\/pairing\/revoke-device$/, async (ctx) => {
+    if (!isLoopbackRequest(ctx.req) || !isSameMachineOrigin(ctx.req)) {
+      throw fail(4003, '下线设备只允许在主机本机操作');
+    }
+    const body = await readJson(ctx.req);
+    const deviceId = String(body.deviceId || '');
+    if (!deviceId) throw fail(4400, '缺少 deviceId');
+    const revoked = pairing.revokeDevice(deviceId);
+    const droppedSessions = typeof core.dropSessionsByDevice === 'function'
+      ? core.dropSessionsByDevice(deviceId) : 0;
+    log(`rest  revoke device=${deviceId} revoked=${revoked} sessions=${droppedSessions}`);
+    return send(ctx.res, 200, {
+      revoked, droppedSessions, deviceId, allDevices: false, at: clock().toISOString(),
+    }, DESKTOP_CORS);
   });
 
   route('POST', /^\/mobile\/v1\/pairing\/revoke$/, async (ctx) => {

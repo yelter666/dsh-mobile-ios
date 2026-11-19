@@ -25,6 +25,8 @@ export function createMockHost({ fixturesDir = DEFAULT_FIXTURES, log = () => {},
   const scenario = read(fixturesDir, 'ws/stream.running.json');
 
   const tasks = new Map(listBody.items.map((t) => [t.taskId, { ...t }]));
+  // 工作区分组：与 cordis  alike，从夹具顶层 workspaces 下发，任务行带同源 id/name。
+  const workspaces = Array.isArray(listBody.workspaces) ? listBody.workspaces : [];
   // 会话动作的 mock 状态（2026-11-18）：置顶/归档集合，与桌面端 workspaceRegistry 同语义。
   // 列表快照据此带 pinned/archived 标记，长按菜单的「取消置顶/取消归档」才能被验证。
   const pinnedIds = new Set();
@@ -131,7 +133,12 @@ export function createMockHost({ fixturesDir = DEFAULT_FIXTURES, log = () => {},
         .filter((t) => (includeArchived ? t.archived : !t.archived));
       all.sort((a, b) => (Number(b.pinned) - Number(a.pinned))
         || (Date.parse(b.lastActivityAt ?? 0) - Date.parse(a.lastActivityAt ?? 0)));
-      return { items: all.slice(0, limit), nextCursor: null, serverTime: new Date().toISOString() };
+      return {
+        items: all.slice(0, limit),
+        workspaces,
+        nextCursor: null,
+        serverTime: new Date().toISOString(),
+      };
     },
 
     async getTask(taskId) {

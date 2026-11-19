@@ -148,10 +148,13 @@ console.log('\n▶ 借鉴（2026-11-18 面板 60 台事故）：installId 去重
   // 出码限速 5 次/分钟：测试要连出 7 个码，用递增时钟逐次越过限速窗口
   let clock = Date.now();
   const svc = new PairingService({ log: () => {}, file, now: () => clock });
+  const tokenById = new Map();
   const pair = (installId, name) => {
     clock += 61_000; // 越过限速窗口，code createdAt/TTL 也随之前移但不影响断言
     const code = svc.issueCode({ deviceName: name }).code;
-    return svc.redeem({ code, installId, deviceName: name });
+    const result = svc.redeem({ code, installId, deviceName: name });
+    tokenById.set(result.deviceId, result.deviceToken);
+    return result;
   };
 
   // 同一 installId 反复重装重配：不应堆记录（历史上同机 6 条、总数 60）
@@ -174,6 +177,30 @@ console.log('\n▶ 借鉴（2026-11-18 面板 60 台事故）：installId 去重
   catch (err) { check('最旧设备被挤掉（4009）', err.code === 4009, `code=${err.code}`); }
   check('其余设备不受影响', svc.verify(tokens.ins_2).deviceName === '反复重装的手机' || svc.verify(tokens.ins_2).deviceName === '手机2');
   check('撤销记录保留做 audit', svc.devices.size >= 6, String(svc.devices.size));
+
+  // 面板设备清单：真实活跃设备 + 展示名，绝不带凭证哈希 / installId
+  const listed = svc.listDevices();
+  check('设备清单只列活跃设备', listed.length === 5, JSON.stringify(listed.map((d) => d.deviceName)));
+  check('设备清单带可读名称', listed.some((d) => d.deviceName.includes('手机')),
+        JSON.stringify(listed.map((d) => d.deviceName)));
+  check('设备清单不泄露凭证哈希', listed.every((d) => !('deviceTokenHash' in d) && !('installId' in d)),
+        JSON.stringify(listed[0]));
+  check('上限常量可从服务读取', svc.maxDevices === 5, String(svc.maxDevices));
+
+  // 单台下线：只影响目标设备，其他凭证仍可用
+  const targetId = listed[0].deviceId;
+  const otherId = listed[1].deviceId;
+  const otherToken = Object.entries(tokens).find(([k]) => k !== 'ins_dup')?.[1];
+  check('下线命中目标设备', svc.revokeDevice(targetId) === 1);
+  check('下线幂等（重复调用返回 0）', svc.revokeDevice(targetId) === 0);
+  check('被下线设备从清单消失', svc.listDevices().every((d) => d.deviceId !== targetId));
+  check('目标设备凭证回 4009', (() => {
+    try {
+      svc.verify(tokenById.get(targetId));
+      return false;
+    } catch (err) { return err.code === 4009; }
+  })());
+  check('其他设备仍在线', svc.listDevices().some((d) => d.deviceId === otherId));
 }
 
 // ---- 6. 损坏注册表自愈 ----

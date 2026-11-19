@@ -47,6 +47,8 @@ check('summary 带 lan 字段（与监听面一致）', summary.body?.lan === ad
   || (summary.body?.lan === null && addr.lan === null), `${summary.body?.lan} vs ${addr.lan}`);
 check('summary 含展示字段且无敏感字段', summary.body?.adapter === 'mock'
   && typeof summary.body?.pairing?.activeDevices === 'number'
+  && summary.body?.pairing?.maxDevices === 5
+  && Array.isArray(summary.body?.pairing?.devices)
   && summary.body?.tunnel?.state !== undefined
   && !('token' in summary.body) && !('credentials' in summary.body), JSON.stringify(summary.body));
 check('summary 带 CORS 头', String(health.headers?.['access-control-allow-origin'] ?? '') === '*'
@@ -221,6 +223,37 @@ c4.send({ t: 'req', id: 'r2', method: 'tasks.rollback' });
 const miss = await c4.until((j) => j?.t === 'res' && j.id === 'r2');
 check('未知方法 → error 4021', miss.json?.error?.code === 4021);
 c4.close();
+
+// ---- 8b. 设备治理：面板看清单、逐台下线 ----
+{
+  const secondCode = await httpJson({ port, method: 'POST', path: '/mobile/v1/pairing/code', body: { deviceName: 'iPad mini' } });
+  const secondRedeem = await httpJson({
+    port, method: 'POST', path: '/mobile/v1/pairing/redeem',
+    body: { code: secondCode.body?.code, installId: 'ins_ipad', deviceName: 'iPad mini', platform: 'ios' },
+  });
+  check('第二台设备配对成功', secondRedeem.status === 200, JSON.stringify(secondRedeem.body));
+  const devicesSummary = await httpJson({ port, path: '/mobile/v1/desktop/summary' });
+  const devices = devicesSummary.body?.pairing?.devices ?? [];
+  check('摘要列出两台设备并显示真实名称',
+        devices.length === 2 && devices.some((d) => d.deviceName === 'iPad mini')
+        && devices.some((d) => d.deviceName === 'iPhone 17 Pro'), JSON.stringify(devices));
+  check('摘要不泄露设备凭证哈希',
+        devices.every((d) => !('deviceTokenHash' in d) && !('installId' in d)), JSON.stringify(devices));
+  check('活跃设备数正确', devicesSummary.body?.pairing?.activeDevices === 2);
+
+  const kicked = await httpJson({
+    port, method: 'POST', path: '/mobile/v1/pairing/revoke-device',
+    body: { deviceId: secondRedeem.body.deviceId },
+  });
+  check('单台下线成功且不波及其他设备',
+        kicked.status === 200 && kicked.body?.revoked === 1, JSON.stringify(kicked.body));
+  const gone = await httpJson({ port, path: '/mobile/v1/tasks', token: secondRedeem.body.deviceToken });
+  check('被下线设备凭证 → 4009', gone.status === 401 && gone.body?.error?.code === 4009, JSON.stringify(gone.body));
+  const stillGood = await httpJson({ port, path: '/mobile/v1/tasks', token });
+  check('其他设备不受影响', stillGood.status === 200);
+  const afterKick = await httpJson({ port, path: '/mobile/v1/desktop/summary' });
+  check('摘要更新为 1 台', afterKick.body?.pairing?.activeDevices === 1);
+}
 
 // ---- 9. diag 与撤销 ----
 const diag = await httpJson({ port, path: '/mobile/v1/diag', token });

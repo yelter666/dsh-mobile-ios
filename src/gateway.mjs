@@ -240,6 +240,27 @@ export class GatewayCore {
     }
   }
 
+  /** 当前完成握手的设备 ID——面板「已配对 N 台」右边标真实在线数用。 */
+  connectedDeviceIds() {
+    return [...new Set(
+      [...this.sessions.values()]
+        .filter((s) => s.ready && s.deviceId)
+        .map((s) => s.deviceId)
+    )];
+  }
+
+  /** 单设备下线时立刻掐断它的 WS：撤销只改注册表，不关会话的话旧连接还能继续读任务。 */
+  dropSessionsByDevice(deviceId) {
+    let n = 0;
+    for (const s of [...this.sessions.values()]) {
+      if (s.deviceId !== deviceId) continue;
+      try { s.close(4009, 'device revoked'); } catch { /* 已断开的会话忽略 */ }
+      this.removeSession(s);
+      n += 1;
+    }
+    return n;
+  }
+
   stats() {
     this.#gcIdempotency();
     const host = this.host.info();

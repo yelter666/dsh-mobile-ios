@@ -242,6 +242,37 @@ export class PairingService {
     return n;
   }
 
+  /**
+   * 桌面面板的设备清单：只回显展示字段，绝不泄露 deviceTokenHash / installId。
+   * 撤销过的设备不入列——面板问的是「现在还能连上来的设备」，
+   * 历史审计记录留在注册表里供 verify() 回 4009，但不给用户看。
+   */
+  listDevices() {
+    return [...this.devices.values()]
+      .filter((d) => !d.revoked && (!d.expiresAt || Date.parse(d.expiresAt) > this.now()))
+      .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
+      .map((d) => ({
+        deviceId: d.deviceId,
+        deviceName: d.deviceName || d.deviceId,
+        platform: d.platform,
+        appVersion: d.appVersion,
+        createdAt: d.createdAt,
+        expiresAt: d.expiresAt,
+      }));
+  }
+
+  /** 单设备下线：设备下次带旧凭证请求会收到 4009 并清本地凭证。 */
+  revokeDevice(deviceId) {
+    const device = this.byDeviceId.get(String(deviceId || ''));
+    if (!device || device.revoked) return 0;
+    device.revoked = true;
+    this.#persist();
+    this.log(`pair  下线设备 device=${device.deviceId} name=${device.deviceName || '-'}`);
+    return 1;
+  }
+
+  get maxDevices() { return MAX_ACTIVE_DEVICES; }
+
   stats() {
     return {
       devices: this.devices.size,

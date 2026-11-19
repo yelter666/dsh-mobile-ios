@@ -114,8 +114,9 @@ function deriveTitle(summary) {
  *
  * needsYou/pendingTodoCount v1 恒 false/0：宿主 summary 不暴露审批态，不编造。
  */
-function summaryToTask(summary, hostName) {
+function summaryToTask(summary, hostName, workspaceIndex = null) {
   const running = summary.running === true;
+  const workspace = workspaceIndex?.bySession.get(String(summary.sessionId));
   return {
     taskId: summary.sessionId,
     title: deriveTitle(summary),
@@ -129,6 +130,10 @@ function summaryToTask(summary, hostName) {
     hostId: 'host_cordis',
     hostName,
     cwd: summary.cwd ?? null,
+    // 桌面侧栏的工作区分组（workspaceRegistry.list() 的 title/sessionIds）。
+    // 没有归属的会话留 null，手机端归到「未分组」——与 tree.ts 的 UNGROUPED_KEY 同口径。
+    workspaceId: workspace?.id ?? null,
+    workspaceName: workspace?.title ?? null,
     needsYou: false,
     pendingTodoCount: 0,
     artifactsCount: 0,
@@ -583,6 +588,35 @@ export function createCordisHost({ ctx, log = () => {}, hostname = os.hostname()
     }
   }
 
+  /**
+   * 桌面侧栏的工作区分组（2026-11-19 与桌面 tree.ts 对齐）。
+   * 权威源 = workspaceRegistry.list()（feed.ts 构建 baseline 的同一处）：
+   * 每项 { workspaceId, title, sessionIds, path, createdAt }。
+   * 拿不到就回空索引——移动端退化为「未分组」，绝不猜 cwd 冒充工作区名。
+   */
+  function workspaceIndex() {
+    const empty = { bySession: new Map(), groups: [] };
+    try {
+      const reg = service('workspaceRegistry', 'workspace/list');
+      const list = typeof reg.list === 'function' ? reg.list() : [];
+      if (!Array.isArray(list)) return empty;
+      const bySession = new Map();
+      const groups = [];
+      for (const ws of list) {
+        if (!ws || !ws.workspaceId) continue;
+        const title = String(ws.title || '').trim();
+        if (!title) continue;
+        groups.push({ id: String(ws.workspaceId), name: title });
+        for (const sid of Array.isArray(ws.sessionIds) ? ws.sessionIds : []) {
+          bySession.set(String(sid), { id: String(ws.workspaceId), title });
+        }
+      }
+      return { bySession, groups };
+    } catch {
+      return empty;
+    }
+  }
+
   function withFlags(task, flags) {
     return {
       ...task,
@@ -634,6 +668,7 @@ export function createCordisHost({ ctx, log = () => {}, hostname = os.hostname()
         // 列表里（怕没有恢复入口），结果用户点「删除/归档」后任务条纹丝不动，
         // 读起来就是「点了没反应」。现在改为默认隐藏 + 独立归档视图恢复。
         const flags = workspaceFlags();
+        const workspaces = workspaceIndex();
         const visible = summaries.filter((s) => {
           const id = String(s.sessionId);
           if (s.origin === 'subagent') return false;
@@ -650,8 +685,14 @@ export function createCordisHost({ ctx, log = () => {}, hostname = os.hostname()
             return (b.updatedAt ?? 0) - (a.updatedAt ?? 0);
           })
           .slice(0, limit)
-          .map((s) => withFlags(summaryToTask(s, hostname), flags));
-        return { items, nextCursor: null, serverTime: new Date().toISOString() };
+          .map((s) => withFlags(summaryToTask(s, hostname, workspaces), flags));
+        // 分组配置随列表下发：手机端据此给出与桌面一致的工作区标题与顺序。
+        return {
+          items,
+          workspaces: workspaces.groups,
+          nextCursor: null,
+          serverTime: new Date().toISOString(),
+        };
       });
     },
 
@@ -660,7 +701,7 @@ export function createCordisHost({ ctx, log = () => {}, hostname = os.hostname()
         const summaries = await summaryList();
         const summary = summaries.find((s) => s.sessionId === taskId);
         if (!summary) throw fail(4011);
-        const task = withFlags(summaryToTask(summary, hostname), workspaceFlags());
+        const task = withFlags(summaryToTask(summary, hostname, workspaceIndex()), workspaceFlags());
         // 产物清单要跟着详情一起回来。
         //
         // 为什么：手机端「对话里那句话提到的文件」要靠 `task.artifacts` 才认得出，
