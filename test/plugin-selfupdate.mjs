@@ -167,6 +167,86 @@ console.log('\n网关自更新\n');
   check('内置解包后版本正确', JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version === '0.2.14');
 }
 
+// 7. 装在宿主配置档里：更新后必须同步版本钉，否则下次 install 按旧钉回滚
+//    真实事故发生在这里：0.2.14 手工拷进 node_modules，配置档与锁文件还写着 0.2.7，
+//    宿主任何一次 install 都会把带 macOS 缺陷的旧版装回来。
+{
+  const profile = fs.mkdtempSync(path.join(tmp, 'profile-'));
+  const root = path.join(profile, 'node_modules', PLUGIN_NAME);
+  fs.mkdirSync(path.join(root, 'lib'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: PLUGIN_NAME, version: '0.2.14' }));
+  fs.writeFileSync(path.join(root, 'lib', 'client.js'), '// 0.2.14\n');
+  fs.writeFileSync(path.join(profile, 'package.json'), `${JSON.stringify({
+    name: 'dsh-profile-desktop',
+    private: true,
+    dependencies: { [PLUGIN_NAME]: '0.2.14' },
+  }, null, 2)}\n`);
+  fs.writeFileSync(path.join(profile, 'pnpm-lock.yaml'), [
+    "lockfileVersion: '9.0'",
+    '',
+    'importers:',
+    '',
+    '  .:',
+    '    dependencies:',
+    `      ${PLUGIN_NAME}:`,
+    '        specifier: 0.2.14',
+    '        version: 0.2.14',
+    '',
+    'packages:',
+    '',
+    `  ${PLUGIN_NAME}@0.2.14:`,
+    '    resolution: {integrity: sha512-STALEOLDHASH==}',
+    "    engines: {node: '>=20'}",
+    '',
+    'snapshots:',
+    '',
+    `  ${PLUGIN_NAME}@0.2.14: {}`,
+    '',
+  ].join('\n'));
+
+  const tgz = buildTgz({
+    'package/package.json': JSON.stringify({ name: PLUGIN_NAME, version: '0.2.15' }),
+    'package/lib/client.js': '// 0.2.15\n',
+    'package/assets/blob.bin': randomBytes(4096),
+  });
+  const fetchImpl = async (url) => {
+    if (String(url).endsWith('.tgz')) return { ok: true, arrayBuffer: async () => tgz };
+    return {
+      ok: true,
+      json: async () => ({
+        'dist-tags': { latest: '0.2.15' },
+        versions: { '0.2.15': { dist: { tarball: 'https://registry.example.test/pkg.tgz', shasum: sha1(tgz) } } },
+      }),
+    };
+  };
+  const res = await selfUpdatePlugin({
+    pluginRoot: root, fetchImpl, execImpl: async () => { throw new Error('不应回退到系统 tar'); },
+  });
+  const manifest = JSON.parse(fs.readFileSync(path.join(profile, 'package.json'), 'utf8'));
+  const lock = fs.readFileSync(path.join(profile, 'pnpm-lock.yaml'), 'utf8');
+  const wantIntegrity = `sha512-${createHash('sha512').update(tgz).digest('base64')}`;
+  check('装在配置档里：更新成功', res.changed === true && res.to === '0.2.15');
+  check('配置档版本钉已同步', res.pinSynced === true, String(res.pinSynced));
+  check('package.json 依赖已改为 0.2.15', manifest.dependencies[PLUGIN_NAME] === '0.2.15');
+  check('锁文件 specifier 已同步', lock.includes('specifier: 0.2.15'));
+  check('锁文件 importers.version 已同步', /version: 0\.2\.15/.test(lock));
+  check('锁文件条目头已同步（packages + snapshots）', (lock.match(new RegExp(`${PLUGIN_NAME}@0\\.2\\.15`, 'g')) || []).length === 2);
+  check('锁文件不再残留旧版本', !lock.includes(`${PLUGIN_NAME}@0.2.14`));
+  check('锁文件 integrity 用新 tarball 现算', lock.includes(wantIntegrity));
+  check('旧 integrity 已消失', !lock.includes('STALEOLDHASH'));
+}
+
+// 8. 开发态（不在 node_modules 里跑）：不许去改仓库上层的 package.json
+{
+  const root = makeRoot('0.2.8');
+  const upper = path.join(path.dirname(root), 'package.json');
+  const marker = `${JSON.stringify({ name: 'workspace', dependencies: { [PLUGIN_NAME]: '0.2.8' } }, null, 2)}\n`;
+  fs.writeFileSync(upper, marker);
+  const res = await selfUpdatePlugin({ pluginRoot: root, fetchImpl: fakeFetch(), execImpl: fakeExec('0.2.9') });
+  check('开发态不同步版本钉', res.pinSynced === false, String(res.pinSynced));
+  check('开发态上层 package.json 原样保留', fs.readFileSync(upper, 'utf8') === marker);
+}
+
 fs.rmSync(tmp, { recursive: true, force: true });
 
 console.log(`\n结果：${pass} 通过 / ${failures.length} 失败\n`);
