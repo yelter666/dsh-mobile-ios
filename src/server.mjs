@@ -19,14 +19,37 @@ function isPrivateIPv4(addr) {
   return PRIVATE_IPV4.some((re) => re.test(addr));
 }
 
-/** 首个非内部私网 IPv4 —— 手机要填的「电脑地址」就来自它 */
-export function lanIPv4() {
-  for (const ifaces of Object.values(os.networkInterfaces())) {
-    for (const i of ifaces || []) {
-      if (i.family === 'IPv4' && !i.internal && isPrivateIPv4(i.address)) return i.address;
+// 虚拟网卡：Windows 上 Hyper-V / WSL / VMware 会各造一块 172.x 的网卡，
+// macOS 上 utun* 是 VPN。如果按「第一个私网地址」取，手机拿到的往往是这些
+// 根本不通的地址 —— 扫码后一直转圈，用户只会以为插件坏了。
+const VIRTUAL_IF = /(vEthernet|VMware|VirtualBox|Hyper-?V|Loopback|WSL|Docker|Tailscale|ZeroTier|TAP-|tap\d|utun|tun\d|ppp\d)/i;
+// 物理网卡常见命名（Windows 中文系统是「以太网 / WLAN / Wi-Fi」，macOS 是 en0/en1）
+const PHYSICAL_IF = /^(en\d|eth\d|wlan\d|wi-?fi|ethernet|以太网|wlan|无线)/i;
+
+/**
+ * 手机要填的「电脑地址」。
+ *
+ * 优先级：物理网卡 > 其它非虚拟网卡；同类里 192.168 > 10 > 172.16-31
+ * （家用路由器几乎都在 192.168，而 172.16/12 更容易是虚拟网段）。
+ * 实在挑不出来再退回「第一个私网 IPv4」，保证老行为不至于更差。
+ */
+export function lanIPv4(ifaces = os.networkInterfaces()) {
+  const candidates = [];
+  for (const [name, list] of Object.entries(ifaces)) {
+    for (const i of list || []) {
+      if (i.family !== 'IPv4' || i.internal || !isPrivateIPv4(i.address)) continue;
+      let score = 0;
+      if (!VIRTUAL_IF.test(name)) score += 10;
+      if (PHYSICAL_IF.test(name)) score += 5;
+      if (i.address.startsWith('192.168.')) score += 3;
+      else if (i.address.startsWith('10.')) score += 2;
+      else score += 1;
+      candidates.push({ address: i.address, score, name });
     }
   }
-  return null;
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0].address;
 }
 
 export function makeHostAllow(suffixes = []) {
@@ -59,6 +82,9 @@ export async function createGateway({
   // 有稳定子域就不该再退化成随机域名。为 null 时保持 Quick Tunnel 行为不变。
   tunnelProvisioner = null,
   tunnelPidFile = null,
+  // 隧道子进程的 spawn 实现。默认用 node:child_process；测试注入假进程，
+  // 嵌入式场景也可替换（TunnelManager 本身已支持，这里只是让网关能透传）。
+  tunnelSpawn = null,
 } = {}) {
   if (!host) throw new Error('createGateway 需要 host 适配器');
 
@@ -99,6 +125,7 @@ export async function createGateway({
     port,
     log,
     executable: tunnelExecutable,
+    ...(tunnelSpawn ? { spawnImpl: tunnelSpawn } : {}),
     // 插件形态默认开自动重拉：宿主进程长活，cloudflared 意外退出后
     // 不重拉的话手机会一直显示「在线」但隧道实际已死。
     autoRestart: tunnelAutoRestart,

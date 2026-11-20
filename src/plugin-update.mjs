@@ -6,8 +6,9 @@
 // 于是「一键更新」在最需要它的机器上恰恰用不了。
 //
 // 这里走的是网关进程自己动手：从 npm registry 取 tarball → 按 dist.shasum 校验 →
-// 解包到临时目录 → 备份旧目录 → 覆盖安装目录。全程不依赖宿主 API、不依赖 shell 别名，
-// 只用 Node 内置能力 + 系统 tar（Win10 1803+ 自带的 bsdtar 命名为 tar.exe）。
+// 解包到临时目录 → 备份旧目录 → 覆盖安装目录。全程不依赖宿主 API，
+// 解包优先用内置实现（src/tar.mjs，零依赖、三平台一致），
+// 只有遇到内置解析不了的老式归档才回退到系统 tar（Win10 1803+ 的 bsdtar）。
 //
 // 边界与克制：
 //   · 只装本插件自己的 npm 包，不接受任意包名/任意 URL（避免变成通用下载执行器）；
@@ -22,6 +23,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
+import { extractTgzToDir } from './tar.mjs';
 
 const execFileAsync = promisify(nodeExecFile);
 
@@ -123,7 +125,18 @@ export async function selfUpdatePlugin({
     fs.writeFileSync(tgz, buf);
 
     fs.mkdirSync(outDir, { recursive: true });
-    await execImpl('tar', ['-xzf', tgz, '-C', outDir], { timeout: 120_000 });
+    try {
+      extractTgzToDir(buf, outDir);
+    } catch (err) {
+      // 内置解析只认 ustar/GNU 常规文件；老式归档或特殊条目回退到系统 tar。
+      // Windows 老版本可能没有 tar.exe，那时错误会同时列出两条原因。
+      log(`plugin 内置解包失败（${err.message}），改用系统 tar`);
+      try {
+        await execImpl('tar', ['-xzf', tgz, '-C', outDir], { timeout: 120_000 });
+      } catch (tarErr) {
+        throw new Error(`解包失败：${err.message}；系统 tar 亦不可用（${tarErr?.message || tarErr}）`);
+      }
+    }
 
     const unpacked = path.join(outDir, 'package');
     if (!fs.existsSync(path.join(unpacked, 'package.json'))) throw new Error('解包后缺少 package.json');

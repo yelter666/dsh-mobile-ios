@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createGateway } from '../src/server.mjs';
 import { createFileLog } from '../src/file-log.mjs';
-import { sweepOrphanTunnels } from '../src/tunnel.mjs';
+import { findCloudflared, sweepOrphanTunnels } from '../src/tunnel.mjs';
 import { createMockHost } from '../src/adapter/mock-host.mjs';
 import { createMuxHost } from '../src/adapter/mux-host.mjs';
 import { createCordisHost } from '../src/adapter/cordis-host.mjs';
@@ -20,35 +20,13 @@ export const name = 'dsh-mobile-ios';
 export const version = PLUGIN_VERSION;
 
 /**
- * 本机 cloudflared 发现链：config.tunnelBin → env CLOUDFLARED_BIN（tunnel.mjs 处理）
- * → ~/.dsh/mobile-access/components/cloudflared/<版本>/cloudflared（社区 dsh-mobile
- * 组件目录，只借用可执行文件不共享状态）→ PATH（'auto'）。
+ * 本机 cloudflared 发现链统一在 src/tunnel.mjs 的 findCloudflared：
+ * config.tunnelBin → env CLOUDFLARED_BIN → 组件目录（~/.dsh/mobile-access/components/cloudflared/<版本>/）
+ * → PATH。这里不再自己扫一遍目录 —— 两份实现曾经对 .exe 后缀的判断不一致，
+ * 直接导致「装好了但开通器找不到」。
  */
-function discoverCloudflared() {
-  const dir = path.join(os.homedir(), '.dsh', 'mobile-access', 'components', 'cloudflared');
-  try {
-    const versions = fs
-      .readdirSync(dir)
-      .filter((v) => !v.startsWith('.'))
-      .sort()
-      .reverse();
-    // Windows 组件目录里的可执行文件名带 .exe；先按平台列候选，命中即用。
-    const binNames = process.platform === 'win32' ? ['cloudflared.exe', 'cloudflared'] : ['cloudflared'];
-    for (const v of versions) {
-      for (const binName of binNames) {
-        const bin = path.join(dir, v, binName);
-        try {
-          fs.accessSync(bin, fs.constants.X_OK);
-          return bin;
-        } catch {
-          /* 版本目录里没有该可执行文件，继续 */
-        }
-      }
-    }
-  } catch {
-    /* 目录不存在 */
-  }
-  return 'auto';
+function resolveCloudflared(config = {}) {
+  return config.tunnelBin || findCloudflared('auto') || 'auto';
 }
 
 /** 兼容 Cordis 的两种清理注册方式；都不可用时退化为 no-op 并明确记录 */
@@ -128,13 +106,12 @@ export function apply(ctx = {}, config = {}) {
     const tunnelCfg = config.tunnel || {};
     const tunnelStateFile = tunnelCfg.stateFile || path.join(os.homedir(), '.dsh', 'mobile-access', 'tunnel-named.json');
     const baseDomain = tunnelCfg.baseDomain || process.env.DSH_TUNNEL_BASE_DOMAIN || 'matrixboard.cn';
-    const cloudflareBin = config.tunnelBin || discoverCloudflared();
+    const cloudflareBin = resolveCloudflared(config);
     const common = {
       baseDomain,
       prefix: tunnelCfg.prefix || 'dsh',
-      executable: cloudflareBin === 'auto'
-        ? (process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared')
-        : cloudflareBin,
+      // 没找到就留 'auto'：让发现链在真正要用的那一刻再解析一次（自动安装发生在启动之后）
+      executable: cloudflareBin,
     };
     const explicit = tunnelCfg.provisioner ? String(tunnelCfg.provisioner) : null;
     const apiToken = tunnelCfg.apiToken || process.env.DSH_CF_API_TOKEN;
@@ -192,8 +169,8 @@ export function apply(ctx = {}, config = {}) {
         || path.join(os.homedir(), '.dsh', 'mobile-access', 'dsh-mobile-ios-devices.json'),
       // 插件形态默认开隧道自动重拉（sidecar/dev 形态不开，避免测试时空转）
       tunnelAutoRestart: config.autoRestart !== undefined ? Boolean(config.autoRestart) : true,
-      // 隧道可执行文件发现链（见 discoverCloudflared）；显式 config.tunnelBin 优先
-      tunnelExecutable: config.tunnelBin || discoverCloudflared(),
+      // 隧道可执行文件发现链（见 resolveCloudflared）；显式 config.tunnelBin 优先
+      tunnelExecutable: cloudflareBin,
       tunnelProvisioner: provisioner,
       log,
     })

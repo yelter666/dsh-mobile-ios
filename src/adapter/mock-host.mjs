@@ -1,28 +1,21 @@
-// adapter/mock-host.mjs — 用契约夹具驱动宿主（决策 D3：Mock 载体）
+// adapter/mock-host.mjs — 用契约样本驱动宿主（决策 D3：Mock 载体）
 // 目的：让客户端与网关在真实宿主不可用时也能跑到端到端；它不模拟"智能"，
 // 只忠实回放契约里已有的报文形状，避免 UI 在假数据上长歪。
 
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { fail, newId } from '../protocol.mjs';
+import { createMockData } from './mock-data.mjs';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-// 目录重构后：夹具统一在项目根的 spec/fixtures/（gateway/src/adapter → 上三级即项目根）
-const DEFAULT_FIXTURES = path.resolve(HERE, '../../../spec/fixtures');
-
-const read = (dir, name) => JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
-
-export function createMockHost({ fixturesDir = DEFAULT_FIXTURES, log = () => {}, autoPlay = false, speed = 1 } = {}) {
-  const hostInfo = read(fixturesDir, 'host/host.info.json').response.body;
-  const listBody = read(fixturesDir, 'tasks/tasks.list.json').response.body;
-  const detail = read(fixturesDir, 'tasks/task.detail.json').response.body;
-  const createOk = read(fixturesDir, 'tasks/task.create.ok.json').response.body;
-  const messageOk = read(fixturesDir, 'tasks/task.message.ok.json').response.body;
-  const cancelOk = read(fixturesDir, 'tasks/task.cancel.ok.json').response.body;
-  const artifacts = read(fixturesDir, 'tasks/task.artifacts.json').response.body;
-  const todoOk = read(fixturesDir, 'tasks/todo.answer.ok.json').response.body;
-  const scenario = read(fixturesDir, 'ws/stream.running.json');
+export function createMockHost({ log = () => {}, autoPlay = false, speed = 1, data = null } = {}) {
+  const fixtures = data || createMockData();
+  const hostInfo = fixtures.hostInfo;
+  const listBody = fixtures.listBody;
+  const detail = fixtures.detail;
+  const createOk = fixtures.createOk;
+  const messageOk = fixtures.messageOk;
+  const cancelOk = fixtures.cancelOk;
+  const artifacts = fixtures.artifacts;
+  const todoOk = fixtures.todoOk;
+  const scenario = fixtures.scenario;
 
   const tasks = new Map(listBody.items.map((t) => [t.taskId, { ...t }]));
   // 工作区分组：与 cordis  alike，从夹具顶层 workspaces 下发，任务行带同源 id/name。
@@ -396,7 +389,7 @@ export function createMockHost({ fixturesDir = DEFAULT_FIXTURES, log = () => {},
     },
 
     async diag() {
-      return { adapter: 'mock', fixturesDir, tasks: tasks.size };
+      return { adapter: 'mock', data: 'builtin', tasks: tasks.size };
     },
 
     subscribe(fn) {
@@ -405,7 +398,7 @@ export function createMockHost({ fixturesDir = DEFAULT_FIXTURES, log = () => {},
     },
 
     /** 回放契约里的 10 帧事件流（间隔按 speed 缩放），用于验收"实时"而不只是"首屏" */
-    playScenario(taskId = 'tsk_a41f9c', { speed: s = speed } = {}) {
+    playScenario(taskId = fixtures.RUNNING_TASK, { speed: s = speed } = {}) {
       clearTimers();
       playing = taskId;
       let acc = 0;

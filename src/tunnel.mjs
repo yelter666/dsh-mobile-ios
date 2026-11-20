@@ -34,34 +34,52 @@ export function redactSecrets(line) {
     .replace(/(Bearer|Ticket)\s+\S+/gi, '$1 [redacted-credential]');
 }
 
+/** 版本目录按数字分段比较：字符串排序会把 2026.9.1 排到 2026.11.1 前面。 */
+function compareVersionDesc(a, b) {
+  const pa = String(a).split(/\D+/).filter(Boolean).map(Number);
+  const pb = String(b).split(/\D+/).filter(Boolean).map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
+    const diff = (pb[i] ?? 0) - (pa[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
 /** 在 PATH 里找可执行文件。找不到返回 null（调用方转成 4021）。 */
 export function findCloudflared(explicit, env = process.env) {
+  // explicit 的三种形态：
+  //   · 'auto'            —— 走完整发现链
+  //   · 含分隔符的绝对/相对路径 —— 只认它（显式指定却不存在 = 缺失，不偷偷换别处的二进制）
+  //   · 裸文件名           —— 当作 PATH 里的名字继续找（历史行为是直接判缺失，
+  //                          于是 sidecar 的 `--tunnel-bin cloudflared` 永远起不来）
+  let name = process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared';
   if (explicit && explicit !== 'auto') {
-    try {
-      accessSync(explicit, constants.X_OK);
-      return explicit;
-    } catch {
-      return null;
+    if (explicit.includes('/') || explicit.includes('\\')) {
+      try {
+        accessSync(explicit, constants.X_OK);
+        return explicit;
+      } catch {
+        return null;
+      }
     }
-  }
-  if (env.CLOUDFLARED_BIN) {
+    name = explicit;
+  } else if (env.CLOUDFLARED_BIN) {
     try {
       accessSync(env.CLOUDFLARED_BIN, constants.X_OK);
       return env.CLOUDFLARED_BIN;
     } catch {
-      /* 落到 PATH 搜索 */
+      /* 落到组件目录/ PATH 搜索 */
     }
   }
-  const name = process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared';
 
   // 自举安装落点优先于 PATH：面板「自动安装 cloudflared」把二进制写进组件目录后，
   // 下次 status()/start() 调 findCloudflared 就能立即发现，无需重启插件/宿主。
-  // 路径约定与 entries/plugin.mjs 的 discoverCloudflared、cloudflared-install.mjs 一致。
+  // 路径约定与 entries/plugin.mjs 的 resolveCloudflared、cloudflared-install.mjs 一致。
   // home 来源与安装侧相同：USERPROFILE/HOME 优先，便于测试隔离与多用户环境。
   const home = env.USERPROFILE || env.HOME || os.homedir();
   const componentRoot = path.join(home, '.dsh', 'mobile-access', 'components', 'cloudflared');
   try {
-    const versions = readdirSync(componentRoot).filter((v) => !v.startsWith('.')).sort().reverse();
+    const versions = readdirSync(componentRoot).filter((v) => !v.startsWith('.')).sort(compareVersionDesc);
     for (const v of versions) {
       const candidate = path.join(componentRoot, v, name);
       try {
@@ -71,7 +89,7 @@ export function findCloudflared(explicit, env = process.env) {
     }
   } catch { /* 组件目录不存在，落到 PATH */ }
 
-  const dirs = (env.PATH || '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin').split(path.delimiter);
+  const dirs = (env.PATH || env.Path || '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin').split(path.delimiter);
   for (const dir of dirs) {
     if (!dir) continue;
     const candidate = path.join(dir, name);
@@ -307,7 +325,7 @@ export class TunnelManager {
           return;
         }
         this.child = child;
-      this.#writePid(child.pid);
+        this.#writePid(child.pid);
 
         timer = setTimeout(() => {
           this.state = 'failed';
@@ -474,6 +492,9 @@ export class TunnelManager {
  */
 export async function sweepOrphanTunnels({ componentDir, log = () => {} } = {}) {
   if (!componentDir) return { killed: 0 };
+  // Windows 没有 pgrep，也不存在「按命令行找进程」的廉价等价物；
+  // 孤儿回收在那里靠 pidFile（#reapStale）兜底，这里直接返回，别每次启动都白 throw 一次。
+  if (process.platform === 'win32') return { killed: 0 };
   const { execFile } = await import('node:child_process');
   const net = await import('node:net');
 

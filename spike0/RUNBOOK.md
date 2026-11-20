@@ -14,8 +14,8 @@
 | 端口 | 3081 空闲（被占用会自动顺延，日志里会写） | `lsof -iTCP:3081 -sTCP:LISTEN` |
 | 代码 | 把 `gateway/` 整个目录拷到该机器 | `scp -r ...` |
 
-> 代码不依赖 Mock 夹具也能启动（mock 适配器读不到夹具时会报错）。
-> 若只拷网关目录，请连同 `spec/fixtures/` 一起拷（并保持 `gateway/` 与 `spec/` 同级），或改用 `--host=mux`。
+> mock 适配器的样本数据已内置在 `src/adapter/mock-data.mjs`（0.2.14 起），
+> 不再需要 `spec/fixtures/`；直接 `--host=mock` 即可跑起来。
 
 ---
 

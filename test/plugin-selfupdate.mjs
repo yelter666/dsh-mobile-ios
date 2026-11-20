@@ -8,8 +8,9 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { selfUpdatePlugin, PLUGIN_NAME } from '../src/plugin-update.mjs';
+import { buildTgz } from './lib/tgz.mjs';
 
 let pass = 0;
 const failures = [];
@@ -132,6 +133,38 @@ console.log('\n网关自更新\n');
   check('解包版本不符时抛错', Boolean(err));
   check('错误点明解包版本不符', /解包版本不符/.test(err?.message || ''));
   check('不符时原版本保持不动', JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version === '0.2.8');
+}
+
+// 6. 内置解包路径：真 tgz + 系统 tar 不可用也必须成功
+//    现实中 Windows 老版本没有 tar.exe，这一步失败就等于「无法自动更新」。
+{
+  const root = makeRoot('0.2.8');
+  const realTgz = buildTgz({
+    'package/package.json': JSON.stringify({ name: PLUGIN_NAME, version: '0.2.14' }),
+    'package/lib/client.js': '// built-in untar\n',
+    // 真实的插件包远大于 1KB，这里塞一段不可压缩内容，避免被「下载内容异常」挡下
+    'package/assets/blob.bin': randomBytes(4096),
+  });
+  const shasum = sha1(realTgz);
+  const fetchImpl = async (url) => {
+    if (String(url).endsWith('.tgz')) return { ok: true, arrayBuffer: async () => realTgz };
+    return {
+      ok: true,
+      json: async () => ({
+        'dist-tags': { latest: '0.2.14' },
+        versions: { '0.2.14': { dist: { tarball: 'https://registry.example.test/pkg.tgz', shasum } } },
+      }),
+    };
+  };
+  let tarCalled = false;
+  const res = await selfUpdatePlugin({
+    pluginRoot: root,
+    fetchImpl,
+    execImpl: async () => { tarCalled = true; throw new Error('tar 不存在'); },
+  });
+  check('内置解包完成升级（不依赖系统 tar）', res.changed === true && !tarCalled);
+  check('内置解包后代码已替换', fs.readFileSync(path.join(root, 'lib', 'client.js'), 'utf8').includes('built-in untar'));
+  check('内置解包后版本正确', JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version === '0.2.14');
 }
 
 fs.rmSync(tmp, { recursive: true, force: true });

@@ -531,7 +531,7 @@ export function createRestRouter({ core, pairing, host, tickets, config = {}, lo
     if (!config.tunnel) throw fail(4021, '隧道能力未启用', { method: 'tunnel.installCloudflared' });
     let result;
     try {
-      result = await ensureCloudflared({ destDir: config.cloudflaredDir || undefined });
+      result = await ensureCloudflared();
     } catch (err) {
       log(`rest  tunnel install-cloudflared 失败 ${err?.code || ''} ${err?.message || err}`);
       throw fail(4500, err?.message || '自动安装 cloudflared 失败', {
@@ -539,6 +539,9 @@ export function createRestRouter({ core, pairing, host, tickets, config = {}, lo
       });
     }
     log(`rest  tunnel install-cloudflared ${result.reused ? '复用' : '已装'} ${result.executable}`);
+    // 回填路径：刚装好的二进制不在 PATH 里，开通器如果还拿裸名字去 execFile 会 ENOENT。
+    // 这一步让「装完 → 同一次会话里继续开通」真正成立，不必重启宿主。
+    config.tunnelProvisioner?.useExecutable?.(result.executable);
     // 立即重取状态：findCloudflared 已把组件目录纳入发现链，装完应马上从 missing 变 found。
     return send(ctx.res, 200, { ...result, status: tunnelSnapshot() }, DESKTOP_CORS);
   });

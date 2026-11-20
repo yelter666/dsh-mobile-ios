@@ -24,6 +24,7 @@ import { fail } from './protocol.mjs';
 import { deriveSubdomain, isValidLabel } from './dns-label.mjs';
 import { dnsWarningFor, evaluateDnsAnswer, probeDns, resolveNs } from './dns-probe.mjs';
 import { cnameBelongsTo, readZoneCert } from './zone-health.mjs';
+import { findCloudflared } from './tunnel.mjs';
 
 const execFileAsync = promisify(nodeExecFile);
 const CLI_TIMEOUT_MS = 45_000;
@@ -114,6 +115,8 @@ export class LocalProvisioner {
     homeDir = os.homedir(),
     log = () => {},
     run = null,
+    // 可注入：解析 cloudflared 时用的环境（PATH / HOME）。测试必须能隔离真实 PATH。
+    env = process.env,
     // 可注入：测试里不该真发 DNS 查询（会等 NXDOMAIN 重试，还依赖外网）
     probe = null,
     // 可注入：解析失败时进一步问「这个域名现在归哪个 Cloudflare 账号」。
@@ -129,6 +132,7 @@ export class LocalProvisioner {
     this.configFile = configFile || path.join(path.dirname(stateFile || path.join(homeDir, 'x')), 'tunnel-config.yml');
     this.seed = seed;
     this.homeDir = homeDir;
+    this.env = env;
     this.log = log;
     this._state = undefined;
     // 可注入，测试里不必真起 cloudflared
@@ -159,7 +163,37 @@ export class LocalProvisioner {
   }
 
   get notConfiguredDetail() {
-    return `在这台电脑的终端执行：${this.executable} tunnel login（浏览器里选 matrixboard.cn 授权）`;
+    const exe = findCloudflared(this.executable, this.env) || findCloudflared('auto', this.env) || this.executable;
+    return `在这台电脑的终端执行：${exe} tunnel login（浏览器里选 ${this.baseDomain} 授权）`;
+  }
+
+  /**
+   * 安装完成后回填刚下载的可执行文件路径。
+   *
+   * 必要性：插件启动那一刻就决定了本实例用哪个 executable，而「自动安装」发生在启动
+   * 之后。新机器（尤其 Windows）上 PATH 里没有 cloudflared，回填前开通会在
+   * `execFile('cloudflared.exe')` 直接 ENOENT —— 用户看到的是「装好了但开通失败」。
+   */
+  useExecutable(executable) {
+    if (executable) this.executable = executable;
+  }
+
+  /**
+   * 解析本次真正要执行的 cloudflared。
+   *
+   * 用发现链而不是信任构造参数：安装落点（组件目录）并不在 PATH 里，裸名字在 Windows
+   * 上会直接 ENOENT，在 macOS 上则要依赖用户 brew 装过。发现链已经把三处都覆盖了。
+   */
+  #resolveExecutable() {
+    const found = findCloudflared(this.executable, this.env) || findCloudflared('auto', this.env);
+    if (!found) {
+      throw fail(4021, '主机未安装 cloudflared，无法开通固定地址', {
+        detail: process.platform === 'win32'
+          ? '在面板点「安装 cloudflared 并开启远程」自动下载，或手动安装后把目录加入 PATH'
+          : '执行 `brew install cloudflared`，或设置 CLOUDFLARED_BIN 指向可执行文件',
+      });
+    }
+    return found;
   }
 
   /** 公网当前 NS（查询失败就当没有：少一句提示不该让整条诊断崩掉）。 */
@@ -255,7 +289,7 @@ export class LocalProvisioner {
   }
 
   async #exec(args) {
-    const { stdout, stderr } = await execFileAsync(this.executable, args, {
+    const { stdout, stderr } = await execFileAsync(this.#resolveExecutable(), args, {
       timeout: CLI_TIMEOUT_MS,
       maxBuffer: 4 * 1024 * 1024,
       env: process.env,

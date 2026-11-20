@@ -9,18 +9,19 @@
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
-import { fileURLToPath } from 'node:url';
 import { TunnelManager, redactSecrets } from '../src/tunnel.mjs';
 import { PairingService } from '../src/pairing.mjs';
 import { createGateway } from '../src/server.mjs';
 import { createMockHost } from '../src/adapter/mock-host.mjs';
 import { httpJson } from './lib/wsclient.mjs';
+import { fakeTunnel } from './lib/fake-tunnel.mjs';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const FAKE_CRASH = path.join(HERE, 'fixtures/fake-cloudflared-crash.sh');
-const FAKE_OK = path.join(HERE, 'fixtures/fake-cloudflared.sh');
-const FAKE_SILENT = path.join(HERE, 'fixtures/fake-cloudflared-silent.sh');
-const ADDR_PATTERN = /^https:\/\/[a-z0-9][a-z0-9-]*\.trycloudflare\.com$/;
+// 假 cloudflared 统一来自 test/lib/fake-tunnel：node 脚本 + spawnImpl，
+// 不再用只能在 POSIX 执行的 .sh（Windows 上 spawn 会 EFTYPE）。
+const CRASH_TUNNEL = fakeTunnel('crash');
+const SILENT_TUNNEL = fakeTunnel('silent');
+const FAKE_CRASH = CRASH_TUNNEL.executable;
+const FAKE_SILENT = SILENT_TUNNEL.executable;
 
 let pass = 0;
 const failures = [];
@@ -54,6 +55,7 @@ console.log('\n▶ 借鉴：隧道意外退出自动重拉');
   const tunnel = new TunnelManager({
     port: 3199,
     executable: FAKE_CRASH,
+    spawnImpl: CRASH_TUNNEL.spawnImpl,
     log: (m) => logs.push(m),
     onAddrChanged: (url, prevUrl) => changes.push({ url, prevUrl }),
     autoRestart: true,
@@ -93,6 +95,7 @@ console.log('\n▶ 借鉴边界：启动失败不重拉');
   const tunnel = new TunnelManager({
     port: 3199,
     executable: FAKE_SILENT, // 永不吐地址 → 必然走超时路径
+    spawnImpl: SILENT_TUNNEL.spawnImpl,
     autoRestart: true,
     restartDelayMs: 120,
     startTimeoutMs: 300,
@@ -118,7 +121,13 @@ console.log('\n▶ 借鉴：设备注册表持久化');
 
   const stat = fs.statSync(file);
   check('注册表文件已落盘', stat.isFile(), file);
-  check('文件权限 0600', (stat.mode & 0o777) === 0o600, (stat.mode & 0o777).toString(8));
+  // Windows 没有 POSIX 权限位（stat.mode 恒 0666），这里只对 POSIX 断言
+  if (process.platform === 'win32') {
+    console.log('  · 跳过「文件权限 0600」：Windows 无 POSIX 权限位');
+    pass += 1;
+  } else {
+    check('文件权限 0600', (stat.mode & 0o777) === 0o600, (stat.mode & 0o777).toString(8));
+  }
 
   // 新实例（模拟网关重启）应恢复设备
   const logB = [];

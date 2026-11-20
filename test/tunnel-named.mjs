@@ -28,10 +28,12 @@ import {
 import { LocalProvisioner, renderConfig } from '../src/provision-local.mjs';
 import { createMockHost } from '../src/adapter/mock-host.mjs';
 import { httpJson } from './lib/wsclient.mjs';
+import { fakeTunnel, FAKE_SCRIPT } from './lib/fake-tunnel.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const FAKE_NAMED = path.join(HERE, 'fixtures/fake-cloudflared-named.sh');
-const FAKE_SILENT = path.join(HERE, 'fixtures/fake-cloudflared-silent.sh');
+// 这些用例都用自制 spawnImpl 模拟子进程，只需要「文件存在」让发现链命中；
+// 指向跨平台的 node 假二进制，不再依赖只能在 POSIX 执行的 .sh。
+const FAKE_NAMED = FAKE_SCRIPT;
 const TOKEN = 'eyJhIjoiZmFrZSIsInQiOiJmYWtlIiwicyI6ImZha2UifQ==';
 
 let pass = 0;
@@ -167,8 +169,14 @@ try {
   // 落盘：0600，且 token 在里面（cloudflared 要用）
   const raw = fs.readFileSync(stateFile, 'utf8');
   check('状态文件含 token', raw.includes(TOKEN));
-  check('状态文件权限 0600', (fs.statSync(stateFile).mode & 0o777) === 0o600,
-    (fs.statSync(stateFile).mode & 0o777).toString(8));
+  // Windows 无 POSIX 权限位（stat.mode 恒 0666），只对 POSIX 断言
+  if (process.platform === 'win32') {
+    console.log('  · 跳过「状态文件权限 0600」：Windows 无 POSIX 权限位');
+    pass += 1;
+  } else {
+    check('状态文件权限 0600', (fs.statSync(stateFile).mode & 0o777) === 0o600,
+      (fs.statSync(stateFile).mode & 0o777).toString(8));
+  }
 
   // 幂等：第二次不再打任何 API
   const before = cf.calls.length;
@@ -726,6 +734,7 @@ function namedTunnelHarness({ pidFile = null, args = [] } = {}) {
     dev: true,
     log: () => {},
     tunnelExecutable: FAKE_NAMED,
+    tunnelSpawn: fakeTunnel('named').spawnImpl,
     tunnelProvisioner: restProv,
   });
   const { port } = await gw.start();

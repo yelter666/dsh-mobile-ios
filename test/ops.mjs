@@ -10,10 +10,13 @@ import { createGateway } from '../src/server.mjs';
 import { TunnelManager } from '../src/tunnel.mjs';
 import { createMockHost } from '../src/adapter/mock-host.mjs';
 import { connect, httpJson } from './lib/wsclient.mjs';
+import { fakeTunnel } from './lib/fake-tunnel.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const FAKE_OK = path.join(HERE, 'fixtures/fake-cloudflared.sh');
-const FAKE_SILENT = path.join(HERE, 'fixtures/fake-cloudflared-silent.sh');
+const FAKE_OK_TUNNEL = fakeTunnel('ok');
+const FAKE_SILENT_TUNNEL = fakeTunnel('silent');
+const FAKE_OK = FAKE_OK_TUNNEL.executable;
+const FAKE_SILENT = FAKE_SILENT_TUNNEL.executable;
 const ADDR_PATTERN = /^https:\/\/[a-z0-9][a-z0-9-]*\.trycloudflare\.com$/;
 
 let pass = 0;
@@ -75,6 +78,7 @@ let liveTunnel = null;
   const tunnel = new TunnelManager({
     port: 3199,
     executable: FAKE_OK,
+    spawnImpl: FAKE_OK_TUNNEL.spawnImpl,
     log: (m) => logs.push(m),
     onAddrChanged: (url, prevUrl) => changes.push({ url, prevUrl }),
   });
@@ -111,6 +115,7 @@ console.log('\n▶ 隧道：启动超时');
   const tunnel = new TunnelManager({
     port: 3199,
     executable: FAKE_SILENT,
+    spawnImpl: FAKE_SILENT_TUNNEL.spawnImpl,
     startTimeoutMs: 500,
   });
   const begin = Date.now();
@@ -137,6 +142,7 @@ const gw = await createGateway({
   dev: true,
   log: (m) => logLines.push(m),
   tunnelExecutable: FAKE_OK,
+  tunnelSpawn: FAKE_OK_TUNNEL.spawnImpl,
 });
 const addr = await gw.start();
 const { port } = addr;
