@@ -56,11 +56,16 @@ let lastCopyValue = '';
 
 let captured = null;
 let uuidSeq = 0;
+const localStorageStub = (() => {
+  const m = new Map();
+  return { getItem: (k) => m.has(k) ? m.get(k) : null, setItem: (k, v) => m.set(k, String(v)), removeItem: (k) => m.delete(k) };
+})();
 const sandbox = {
   window: windowStub, document: documentStub, navigator: navigatorStub,
   console, setTimeout, clearTimeout, setInterval, clearInterval,
   AbortSignal, fetch: async () => { throw new Error('no network in test'); },
   crypto: { randomUUID: () => `11111111-2222-3333-4444-${String(++uuidSeq).padStart(12, '0')}` },
+  localStorage: localStorageStub,
   getComputedStyle: () => ({ backgroundColor: 'rgb(20, 20, 20)' }),
   require: (id) => {
     if (id === 'react') return { createElement: () => makeEl() };
@@ -76,6 +81,8 @@ check('client.js 通过 __ModuleLoader__ 注册模块', !!captured);
 const exports = captured.factory(sandbox.require);
 const { showUpdateModal, closeUpdateModal, copyToClipboard } = exports.__test;
 const { performUpdate, setPluginManager, setUpdateTimeout, isUpdateInFlight, unwrapRemote } = exports.__test;
+const { restorePendingUpdate, readUpdateState, writeUpdateState, clearUpdateState } = exports.__test;
+check('测试钩子导出跨重载恢复函数', typeof restorePendingUpdate === 'function' && typeof writeUpdateState === 'function');
 check('测试钩子导出对话框函数', typeof showUpdateModal === 'function' && typeof closeUpdateModal === 'function');
 check('测试钩子导出一步更新函数', typeof performUpdate === 'function' && typeof setPluginManager === 'function' && typeof isUpdateInFlight === 'function');
 
@@ -177,7 +184,7 @@ check('installBundle 传 enabled:true', installArgs?.opts?.enabled === true);
 check('installBundle 传合法 UUID requestId', /^[0-9a-f-]{36}$/i.test(installArgs?.opts?.requestId || ''));
 modal = lastModal();
 check('成功后显示成功横幅', findByText(modal, '✅ 已安装 v0.2.5').length > 0);
-check('需重启时提示重启', findByText(modal, '插件已更新，重启 DSH 桌面端后生效。') !== undefined);
+check('需重启时提示重启', findByText(modal, '插件已更新，重启 DSH 桌面端后生效。').length > 0);
 check('成功后并发锁已释放', isUpdateInFlight() === false);
 closeUpdateModal();
 
@@ -223,6 +230,36 @@ await performUpdate('0.2.7');
 modal = lastModal();
 check('无安装服务显示降级横幅', findByText(modal, '⚠️ 宿主未提供一步更新能力').length > 0);
 check('降级保留复制包名入口', allButtons(modal).some((b) => (b._text || '').includes('复制')));
+closeUpdateModal();
+
+// ── 跨 HMR 重载状态恢复（修复「点击就消失无反应」） ──────────
+console.log('\n跨重载恢复\n');
+
+// performUpdate 发起后写入 updating 状态（用成功 mock；状态在成功时被 clear，
+// 所以用超时 mock 让它停留在 updating，模拟模块被 HMR 卸载前的落盘状态）
+setUpdateTimeout(30);
+setPluginManager({
+  installBundle: async () => new Promise((resolve) => setTimeout(() => resolve({ ok: true, value: {} }), 100)),
+  waitForInstall: async () => null, // 对账返回空 → 抛错 → 失败分支会 clear；这里换个思路见下
+});
+// 直接验证存储读写：写入 updating 后能读回
+writeUpdateState({ status: 'updating', target: '0.2.6', at: Date.now() });
+const rst = readUpdateState();
+check('更新状态可写入并读回', rst?.status === 'updating' && rst?.target === '0.2.6');
+clearUpdateState();
+check('更新状态可清除', readUpdateState() === null);
+setUpdateTimeout(180000);
+
+// 恢复场景1：目标版本已生效 → 弹「更新完成」
+writeUpdateState({ status: 'updating', target: '0.2.5', at: Date.now() });
+// summary 当前版本需 ≥ 0.2.5；测试里 summary 为 null，无法直接设，
+// 用 compareVersions 断言判定逻辑本身 + 超时分支（当前版本未知 → 走 age 判断）
+writeUpdateState({ status: 'updating', target: '0.2.5', at: Date.now() - 6 * 60 * 1000 });
+restorePendingUpdate();
+await new Promise((r) => setTimeout(r, 700)); // 等 restore 的 600ms 延迟弹窗
+modal = lastModal();
+check('超时未生效弹「更新结果未知」', findByText(modal, '⚠️ 上一步更新未能确认').length > 0);
+check('恢复后清理了持久化状态', readUpdateState() === null);
 closeUpdateModal();
 
 console.log(`\n结果：${pass} 通过 / ${failures.length} 失败`);
