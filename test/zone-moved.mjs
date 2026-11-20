@@ -468,7 +468,6 @@ console.log('\n11) 老状态文件没有 account 字段：靠「隧道是否还�
   await p2.ensure({ port: 3081 });
   check('隧道仍在当前账号 → 不重建', !keep.some((c) => c.startsWith('tunnel create')), keep.join(' | '));
   check('隧道仍在当前账号 → id 不变', JSON.parse(fs.readFileSync(stateFile, 'utf8')).tunnelId === newTunnel);
-
   // 边界：列表查不到（网络/凭据抖动）不能把好好的隧道判死
   const flaky = [];
   const p3 = new LocalProvisioner({
@@ -488,6 +487,121 @@ console.log('\n11) 老状态文件没有 account 字段：靠「隧道是否还�
   await p3.ensure({ port: 3081 });
   check('列表查不到时保守复用（不因抖动重建）', !flaky.some((c) => c.startsWith('tunnel create')), flaky.join(' | '));
   check('列表查不到时 id 保持', JSON.parse(fs.readFileSync(stateFile, 'utf8')).tunnelId === newTunnel);
+}
+
+console.log('\n12) 真实 cloudflared list 输出：deleted_at 是 Go 零值时间，不算已删除\n');
+{
+  // 0.2.12 现场事故：`cloudflared tunnel list --output json` 对**未删除**的隧道返回
+  // "deleted_at": "0001-01-01T00:00:00Z"（Go 零值时间，既不是 null 也不是空串）。
+  // 用 !t.deleted_at 判定 → 账号里所有活隧道都被当成已删除 → 按名查找永远落空
+  // → 每次开通都去 create → "tunnel with name already exists"。
+  const home = path.join(tmp, 'home-zero-time');
+  const cfDir = path.join(home, '.cloudflared');
+  fs.mkdirSync(cfDir, { recursive: true });
+  const acc = 'bb53f02d73b7b0722fca9cbe23bdf10f';
+  fs.writeFileSync(path.join(cfDir, 'cert.pem'), fakeCert({ accountId: acc }));
+  const existing = '54ced37f-388e-42a7-894f-ee23a45a728b';
+  const stateFile = path.join(home, 'tunnel-named.json');
+  // 事故现场原样：tunnelId 有效、dnsOk 已为 true，但状态文件**没记 account**
+  // （0.2.11 之前都是这样）→ 进入「不知道归属」分支 → 去问 Cloudflare。
+  // 旧逻辑在这里把零值 deleted_at 当已删除 → 判 alive=false → 误重建 → create → already exists。
+  fs.writeFileSync(stateFile, JSON.stringify({
+    version: 1,
+    installationId: 'zero1',
+    subdomain: 'dsh-zero00000',
+    hostname: 'dsh-zero00000.matrixboard.cn',
+    tunnelId: existing,
+    credentialsFile: path.join(cfDir, `${existing}.json`),
+    configFile: path.join(home, 'tunnel-config.yml'),
+    port: 3081,
+    dnsOk: true,
+  }));
+  fs.writeFileSync(path.join(cfDir, `${existing}.json`), '{}', { mode: 0o600 });
+
+  // 逐字复制真实输出形态（含 created_at 与零值 deleted_at）
+  const realList = JSON.stringify([{
+    id: existing,
+    name: 'dsh-zero00000',
+    created_at: '2026-11-20T12:46:21.000000Z',
+    deleted_at: '0001-01-01T00:00:00Z',
+    connections: [],
+  }]);
+
+  const calls = [];
+  const logs = [];
+  const p = new LocalProvisioner({
+    baseDomain: 'matrixboard.cn',
+    seed: 'zero-seed',
+    stateFile,
+    configFile: path.join(home, 'tunnel-config.yml'),
+    homeDir: home,
+    log: (m) => logs.push(m),
+    run: async (args) => {
+      calls.push(args.join(' '));
+      if (args[1] === 'list') return realList;
+      if (args[1] === 'create') return 'INF Created tunnel dsh-zero00000 with id 00000000-0000-0000-0000-000000000000';
+      return 'INF Added CNAME';
+    },
+    probe: async () => ({ ok: true, kind: 'CNAME', records: [`${existing}.cfargotunnel.com`] }),
+    ownerLookup: async () => null,
+  });
+  const r = await p.ensure({ port: 3081 });
+  check('零值 deleted_at 视为存在：不 create（旧逻辑会撞 already exists）',
+    !calls.some((c) => c.startsWith('tunnel create')), calls.join(' | '));
+  check('不误判为「不在账号里」而触发重建',
+    !logs.some((m) => String(m).includes('重建隧道')), logs.join(' | '));
+  check('复用的是账号里已存在的隧道 id', r.tunnelId === existing, String(r.tunnelId));
+  check('状态文件写入同一隧道，地址不变', JSON.parse(fs.readFileSync(stateFile, 'utf8')).tunnelId === existing);
+
+  // 再点一次开通（account 已补写进状态文件）——此时归属已明确，不该再拉任何子进程
+  const before = calls.length;
+  await p.ensure({ port: 3081 });
+  check('归属明确后重复开通零 CLI 调用（不重复拉 list）',
+    calls.length === before, calls.slice(before).join(' | ') || '（无新增）');
+
+  // 相反方向：归属未知 + deleted_at 是真实时间 → 确属已删除，必须重建
+  const home2 = path.join(tmp, 'home-really-deleted');
+  const cfDir2 = path.join(home2, '.cloudflared');
+  fs.mkdirSync(cfDir2, { recursive: true });
+  fs.writeFileSync(path.join(cfDir2, 'cert.pem'), fakeCert({ accountId: acc }));
+  const stateFile2 = path.join(home2, 'tunnel-named.json');
+  fs.writeFileSync(stateFile2, JSON.stringify({
+    version: 1,
+    installationId: 'gone1',
+    subdomain: 'dsh-gone00000',
+    hostname: 'dsh-gone00000.matrixboard.cn',
+    tunnelId: 'dead0000-0000-0000-0000-000000000000',
+    credentialsFile: path.join(cfDir2, 'dead.json'),
+    configFile: path.join(home2, 'tunnel-config.yml'),
+    port: 3081,
+    dnsOk: true,
+  }));
+  const fresh = '77777777-6666-5555-4444-333333333333';
+  const calls2 = [];
+  const p2 = new LocalProvisioner({
+    baseDomain: 'matrixboard.cn',
+    seed: 'gone-seed',
+    stateFile: stateFile2,
+    configFile: path.join(home2, 'tunnel-config.yml'),
+    homeDir: home2,
+    log: () => {},
+    run: async (args) => {
+      calls2.push(args.join(' '));
+      if (args[1] === 'list') {
+        return JSON.stringify([{ id: 'dead0000-0000-0000-0000-000000000000', name: 'dsh-gone00000', deleted_at: '2026-11-19T00:00:00Z' }]);
+      }
+      if (args[1] === 'create') {
+        fs.writeFileSync(path.join(cfDir2, `${fresh}.json`), '{}', { mode: 0o600 });
+        return `INF Created tunnel dsh-gone00000 with id ${fresh}`;
+      }
+      return 'INF Added CNAME';
+    },
+    probe: async () => ({ ok: true, kind: 'CNAME', records: [`${fresh}.cfargotunnel.com`] }),
+    ownerLookup: async () => null,
+  });
+  const r2 = await p2.ensure({ port: 3081 });
+  check('真删除的隧道不被复用，走 create', calls2.some((c) => c.startsWith('tunnel create')), calls2.join(' | '));
+  check('新建后拿到新 id', r2.tunnelId === fresh, String(r2.tunnelId));
 }
 
 fs.rmSync(tmp, { recursive: true, force: true });

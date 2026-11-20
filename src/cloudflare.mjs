@@ -436,7 +436,10 @@ export class CloudflareProvisioner extends BaseProvisioner {
       'GET',
       `/accounts/${this.accountId}/cfd_tunnel?name=${encodeURIComponent(name)}&is_deleted=false`,
     );
-    const hit = (Array.isArray(list) ? list : []).find((t) => t && t.name === name && !t.deleted_at);
+    // REST 这边未删除给的是 null，与 CLI 的 "0001-01-01T00:00:00Z" 不同；
+    // 两种都按「没删」处理，免得两条开通路径对同一条隧道得出相反结论。
+    const hit = (Array.isArray(list) ? list : []).find((t) => t && t.name === name
+      && (!t.deleted_at || String(t.deleted_at).startsWith('0001-01-01')));
     if (hit) {
       // 本地管理型 tunnel 不接受远端 ingress 下发，拿 token 跑起来会没有路由。
       if (hit.remote_config === false) {

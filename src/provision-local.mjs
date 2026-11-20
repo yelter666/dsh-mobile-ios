@@ -31,6 +31,22 @@ const STATE_VERSION = 1;
 
 const UUID_PATTERN = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
 
+/**
+ * 这条隧道是否还活着（未删除）。
+ *
+ * 坑：`cloudflared tunnel list --output json` 对**未删除**的隧道给的是 Go 的零值时间
+ * `"deleted_at": "0001-01-01T00:00:00Z"`，既不是 null 也不是空串。所以 `!t.deleted_at`
+ * 会把账号里每一条活隧道都判成已删除 —— 后果是「按名查找」永远落空，每次开通都去
+ * create 然后撞 `tunnel with name already exists`（0.2.12 现场就是这个）。
+ * 判定必须同时接受：字段缺失 / null / 空串 / 零值时间。
+ */
+function isLiveTunnel(t) {
+  if (!t || !t.id) return false;
+  const deleted = t.deleted_at;
+  if (!deleted) return true;
+  return String(deleted).startsWith('0001-01-01');
+}
+
 function readState(file, log) {
   if (!file) return null;
   try {
@@ -273,7 +289,7 @@ export class LocalProvisioner {
   async #findTunnelByName(label) {
     const list = await this.#listTunnels();
     if (!list) return null; // 老版本不支持 --output；交给 create 的报错去说明
-    const hit = list.find((t) => t && t.name === label && !t.deleted_at);
+    const hit = list.find((t) => isLiveTunnel(t) && t.name === label);
     return hit?.id ? { id: hit.id } : null;
   }
 
@@ -286,7 +302,7 @@ export class LocalProvisioner {
     if (!tunnelId) return undefined;
     const list = await this.#listTunnels();
     if (!list) return null;
-    return list.some((t) => t && t.id === tunnelId && !t.deleted_at);
+    return list.some((t) => isLiveTunnel(t) && t.id === tunnelId);
   }
 
   async ensure({ port, force = false } = {}) {
@@ -295,15 +311,23 @@ export class LocalProvisioner {
     // 旧 tunnel 属于上一个账号，继续拿它的 id 去 route dns 只会得到 "tunnel not found"，
     // 或者更糟——静默写不进去却以为自己开通成功。真判定有两条线：
     //   1) 状态文件记了 account 且与当前 cert 不一致 → 确知换了账号；
-    //   2) 没记（老状态文件）或记不清 → 直接问 Cloudflare 这条 tunnel 还在不在当前账号。
-    // 只靠 1) 不够：0.2.11 之前写下的状态文件根本没有 account 字段，那才是升级后的真实起点。
+    //   2) 没记（0.2.11 之前的状态文件没有这个字段）→ 直接问 Cloudflare 这条 tunnel
+    //      还在不在当前账号（`tunnel list --output json`）。
+    // 注意线 2) 只在「不知道归属」时才走：两种情况都清楚了还去拉子进程，会让面板每次
+    // 点开通都多几百毫秒（tunnel-named 里「重复开通不再调 CLI」这条契约就是拦这个的）。
     // 账号变了就当新装：重建隧道、保留同一个子域（地址不变，用户不用重新记/重新扫码）。
     const account = readZoneCert({ homeDir: this.homeDir })?.accountId || null;
     let cached = this.state;
     let rebuild = false;
     if (cached?.tunnelId) {
       const knownMismatch = Boolean(cached.account && account && cached.account !== account);
-      const alive = knownMismatch ? false : await this.#tunnelInAccount(cached.tunnelId);
+      // 只有「当前证书能读出账号，但状态文件没记」才算归属未知。反过来若连证书都解析
+      // 不出账号（cert.pem 被换过/格式不同），那属于凭据异常，此时去 list 再拿不到就
+      // 判重建会变成反复重建隧道 —— 比保留旧 id 危险得多，所以这种情况直接信任缓存。
+      const unknownOwner = Boolean(account) && !cached.account;
+      const alive = knownMismatch
+        ? false
+        : unknownOwner ? await this.#tunnelInAccount(cached.tunnelId) : true;
       if (knownMismatch || alive === false) {
         this.log(knownMismatch
           ? `tunnel 授权账号已变更（${String(cached.account).slice(0, 8)}… → ${String(account).slice(0, 8)}…），重建隧道`
@@ -319,6 +343,12 @@ export class LocalProvisioner {
           dnsTampered: false,
           zone: null,
         };
+      } else if (alive === true && cached.account !== account) {
+        // 校验通过：把归属记下来。否则每次开通都因为「不知道归谁」再问一遍 Cloudflare，
+        // 白白多一个子进程的延迟（这条路径就是给老状态文件补账的）。
+        cached = { ...cached, account };
+        this._state = cached;
+        writeState(this.stateFile, cached);
       }
     }
     // 走完整开通：缓存里的 port/hostname 看着都可用，但它们描述的是上一个账号的隧道，
