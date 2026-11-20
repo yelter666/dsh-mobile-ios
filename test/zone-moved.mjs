@@ -381,7 +381,10 @@ console.log('\n10) 授权账号变更：重建隧道但保留同一个固定地�
     log: () => {},
     run: async (args) => {
       calls.push(args.join(' '));
-      return args[1] === 'list' ? '[]' : 'INF ok';
+      // 账号没变、隧道确实还在账号里：列表必须如实返回它，否则会被判成孤儿隧道
+      return args[1] === 'list'
+        ? JSON.stringify([{ id: newTunnel, name: 'dsh-keepme0000' }])
+        : 'INF ok';
     },
     probe: async () => ({ ok: true, kind: 'CNAME', records: [`${newTunnel}.cfargotunnel.com`] }),
   });
@@ -390,6 +393,101 @@ console.log('\n10) 授权账号变更：重建隧道但保留同一个固定地�
   await again.ensure({ port: 3082 });
   check('账号未变时不重建隧道', JSON.parse(fs.readFileSync(stateFile, 'utf8')).tunnelId === newTunnel);
   check('账号未变时不调用 create', !calls.slice(before).some((c) => c.startsWith('tunnel create')), calls.slice(before).join(' | '));
+}
+
+console.log('\n11) 老状态文件没有 account 字段：靠「隧道是否还在当前账号」判定\n');
+{
+  // 0.2.11 之前写下的状态文件根本没有 account 字段，只记了 tunnelId。
+  // 只比对 account 会漏判——必须真去问 Cloudflare 这条隧道还在不在。
+  const home = path.join(tmp, 'home-legacy-state');
+  const cfDir = path.join(home, '.cloudflared');
+  fs.mkdirSync(cfDir, { recursive: true });
+  fs.writeFileSync(path.join(cfDir, 'cert.pem'), fakeCert({ accountId: 'cccccccccccccccccccccccccccccccc' }));
+  const oldTunnel = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+  const newTunnel = 'ffffffff-1111-2222-3333-444444444444';
+  const stateFile = path.join(home, 'tunnel-named.json');
+  const legacy = {
+    version: 1,
+    installationId: 'legacy1',
+    subdomain: 'dsh-legacy0000',
+    hostname: 'dsh-legacy0000.matrixboard.cn',
+    tunnelId: oldTunnel,
+    credentialsFile: path.join(cfDir, `${oldTunnel}.json`),
+    configFile: path.join(home, 'tunnel-config.yml'),
+    port: 3081,
+    dnsOk: false,
+  };
+  fs.writeFileSync(stateFile, JSON.stringify(legacy)); // 注意：没有 account
+  fs.writeFileSync(path.join(cfDir, `${oldTunnel}.json`), '{}', { mode: 0o600 });
+
+  const calls = [];
+  const p = new LocalProvisioner({
+    baseDomain: 'matrixboard.cn',
+    seed: 'legacy-switch',
+    stateFile,
+    configFile: path.join(home, 'tunnel-config.yml'),
+    homeDir: home,
+    log: () => {},
+    run: async (args) => {
+      calls.push(args.join(' '));
+      // 当前账号的隧道列表里只有别的隧道，没有 oldTunnel
+      if (args[1] === 'list') return JSON.stringify([{ id: 'other', name: 'someone-else' }]);
+      if (args[1] === 'create') {
+        fs.writeFileSync(path.join(cfDir, `${newTunnel}.json`), '{}', { mode: 0o600 });
+        return `INF Created tunnel ${args[2]} with id ${newTunnel}`;
+      }
+      return 'INF Added CNAME';
+    },
+    probe: async () => ({ ok: true, kind: 'CNAME', records: [`${newTunnel}.cfargotunnel.com`] }),
+    ownerLookup: async () => null,
+  });
+  const r = await p.ensure({ port: 3081 });
+  const st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  check('查了当前账号的隧道列表', calls.some((c) => c.startsWith('tunnel list')), calls.join(' | '));
+  check('旧隧道不在账号里 → 重建', st.tunnelId === newTunnel, st.tunnelId);
+  check('重建后仍沿用同一个子域', r.hostname === 'dsh-legacy0000.matrixboard.cn', r.hostname);
+  check('重建后补写 account 字段', st.account === 'cccccccccccccccccccccccccccccccc', String(st.account));
+
+  // 反向：隧道确实还在当前账号（列表里有它）→ 不该重建
+  fs.writeFileSync(stateFile, JSON.stringify({ ...legacy, tunnelId: newTunnel, credentialsFile: path.join(cfDir, `${newTunnel}.json`) }));
+  const keep = [];
+  const p2 = new LocalProvisioner({
+    baseDomain: 'matrixboard.cn',
+    seed: 'legacy-switch',
+    stateFile,
+    configFile: path.join(home, 'tunnel-config.yml'),
+    homeDir: home,
+    log: () => {},
+    run: async (args) => {
+      keep.push(args.join(' '));
+      if (args[1] === 'list') return JSON.stringify([{ id: newTunnel, name: 'dsh-legacy0000' }]);
+      return 'INF ok';
+    },
+    probe: async () => ({ ok: true, kind: 'CNAME', records: [`${newTunnel}.cfargotunnel.com`] }),
+  });
+  await p2.ensure({ port: 3081 });
+  check('隧道仍在当前账号 → 不重建', !keep.some((c) => c.startsWith('tunnel create')), keep.join(' | '));
+  check('隧道仍在当前账号 → id 不变', JSON.parse(fs.readFileSync(stateFile, 'utf8')).tunnelId === newTunnel);
+
+  // 边界：列表查不到（网络/凭据抖动）不能把好好的隧道判死
+  const flaky = [];
+  const p3 = new LocalProvisioner({
+    baseDomain: 'matrixboard.cn',
+    seed: 'legacy-switch',
+    stateFile,
+    configFile: path.join(home, 'tunnel-config.yml'),
+    homeDir: home,
+    log: () => {},
+    run: async (args) => {
+      flaky.push(args.join(' '));
+      if (args[1] === 'list') throw new Error('network unreachable');
+      return 'INF ok';
+    },
+    probe: async () => ({ ok: true, kind: 'CNAME', records: [`${newTunnel}.cfargotunnel.com`] }),
+  });
+  await p3.ensure({ port: 3081 });
+  check('列表查不到时保守复用（不因抖动重建）', !flaky.some((c) => c.startsWith('tunnel create')), flaky.join(' | '));
+  check('列表查不到时 id 保持', JSON.parse(fs.readFileSync(stateFile, 'utf8')).tunnelId === newTunnel);
 }
 
 fs.rmSync(tmp, { recursive: true, force: true });

@@ -252,46 +252,78 @@ export class LocalProvisioner {
     if (!fs.existsSync(cert)) throw fail(4021, this.notConfiguredMessage, { detail: this.notConfiguredDetail });
   }
 
-  async #findTunnelByName(label) {
+  /** 当前授权账号下的隧道列表；拿不到就返回 null（调用方必须当「未知」处理，不能当「没有」）。 */
+  async #listTunnels() {
     let raw;
     try {
       raw = await this.run(['tunnel', 'list', '--output', 'json']);
     } catch {
-      return null; // 老版本不支持 --output；交给 create 的报错去说明
+      return null; // 老版本不支持 --output，或网络/凭据问题；交给 create 的报错去说明
     }
     const start = raw.indexOf('[');
     if (start < 0) return null;
-    const list = JSON.parse(raw.slice(start));
-    const hit = Array.isArray(list) ? list.find((t) => t && t.name === label && !t.deleted_at) : null;
+    try {
+      const list = JSON.parse(raw.slice(start));
+      return Array.isArray(list) ? list : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async #findTunnelByName(label) {
+    const list = await this.#listTunnels();
+    if (!list) return null; // 老版本不支持 --output；交给 create 的报错去说明
+    const hit = list.find((t) => t && t.name === label && !t.deleted_at);
     return hit?.id ? { id: hit.id } : null;
+  }
+
+  /**
+   * 这条 tunnel 是否还在当前授权账号里。
+   * true / false 之外还有 null（查不到）——null 必须当作「可能还在」，别因为一次网络抖动
+   * 就把用户正常的隧道判死重建。返回 undefined 表示根本没 id 可查。
+   */
+  async #tunnelInAccount(tunnelId) {
+    if (!tunnelId) return undefined;
+    const list = await this.#listTunnels();
+    if (!list) return null;
+    return list.some((t) => t && t.id === tunnelId && !t.deleted_at);
   }
 
   async ensure({ port, force = false } = {}) {
     if (!Number.isInteger(port) || port <= 0) throw fail(4400, '开通隧道需要有效端口');
-    // 授权账号可能变过（域名迁移到另一个 Cloudflare 账号后重新 login 就是这种情况）：
-    // 旧 tunnel 属于上一个账号，继续拿它的 id 去 route dns 只会得到
-    // "tunnel not found" 或更糟的静默失败。账号变了就当新装：重建隧道、保留同一个子域
-    // （地址不变，用户不用重新记/重新扫）。
+    // 授权账号可能变过（域名迁到另一个 Cloudflare 账号后重新 login 就是这种情况）：
+    // 旧 tunnel 属于上一个账号，继续拿它的 id 去 route dns 只会得到 "tunnel not found"，
+    // 或者更糟——静默写不进去却以为自己开通成功。真判定有两条线：
+    //   1) 状态文件记了 account 且与当前 cert 不一致 → 确知换了账号；
+    //   2) 没记（老状态文件）或记不清 → 直接问 Cloudflare 这条 tunnel 还在不在当前账号。
+    // 只靠 1) 不够：0.2.11 之前写下的状态文件根本没有 account 字段，那才是升级后的真实起点。
+    // 账号变了就当新装：重建隧道、保留同一个子域（地址不变，用户不用重新记/重新扫码）。
     const account = readZoneCert({ homeDir: this.homeDir })?.accountId || null;
     let cached = this.state;
-    let accountChanged = false;
-    if (cached?.account && account && cached.account !== account) {
-      this.log(`tunnel 授权账号已变更（${cached.account.slice(0, 8)}… → ${account.slice(0, 8)}…），重建隧道`);
-      accountChanged = true;
-      cached = {
-        ...cached,
-        account,
-        tunnelId: null,
-        credentialsFile: null,
-        configFile: null,
-        dnsOk: null,
-        dnsTampered: false,
-        zone: null,
-      };
+    let rebuild = false;
+    if (cached?.tunnelId) {
+      const knownMismatch = Boolean(cached.account && account && cached.account !== account);
+      const alive = knownMismatch ? false : await this.#tunnelInAccount(cached.tunnelId);
+      if (knownMismatch || alive === false) {
+        this.log(knownMismatch
+          ? `tunnel 授权账号已变更（${String(cached.account).slice(0, 8)}… → ${String(account).slice(0, 8)}…），重建隧道`
+          : `tunnel ${String(cached.tunnelId).slice(0, 8)}… 不在当前授权账号里，重建隧道`);
+        rebuild = true;
+        cached = {
+          ...cached,
+          account,
+          tunnelId: null,
+          credentialsFile: null,
+          configFile: null,
+          dnsOk: null,
+          dnsTampered: false,
+          zone: null,
+        };
+      }
     }
-    // 账号变了就必须走完整开通：缓存里的 port/hostname 看着都可用，
-    // 但它们描述的是上一个账号的隧道，跳过缓存才不会「解析通了就以为没事」。
-    if (!force && !accountChanged && cached?.hostname && cached.port === port) {
+    // 走完整开通：缓存里的 port/hostname 看着都可用，但它们描述的是上一个账号的隧道，
+    // 跳过缓存才不会「解析通了就以为没事」。
+    if (!force && !rebuild && cached?.hostname && cached.port === port) {
       // 与 BaseProvisioner 同策略：没确认过就现场验一次（含防篡改评估）
       if (cached.dnsOk !== true) {
         const { verdict, zone } = await this.#evaluate(cached.hostname, cached.tunnelId);
