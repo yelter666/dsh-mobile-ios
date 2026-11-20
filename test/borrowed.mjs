@@ -310,7 +310,10 @@ console.log('\n▶ 借鉴：revoke 管理面仅本机');
     console.log('  ⚠ 本机无非回环 IPv4 地址，跳过端到端非回环实测（单元路径已覆盖）');
   } else {
     const host = createMockHost({ log: () => {} });
-    const gw = await createGateway({ host, port: 3188, dev: true, allowLan: true, log: () => {} });
+    const gw = await createGateway({
+      host, port: 3188, dev: true, allowLan: true, log: () => {},
+      tunnelPidFile: path.join(tmpRoot, 'gw.pid'),
+    });
     const addr = await gw.start();
     const codeRes = await httpJson({ port: addr.port, host: lanAddr, method: 'POST', path: '/mobile/v1/pairing/code', body: {} });
     check('端到端：非本机来源配对码 → 4003', codeRes.status === 403 && codeRes.body?.error?.code === 4003,

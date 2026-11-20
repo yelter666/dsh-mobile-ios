@@ -5,6 +5,7 @@
 // 而不是只断言函数返回值。
 
 import path from 'node:path';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createGateway } from '../src/server.mjs';
 import { TunnelManager } from '../src/tunnel.mjs';
@@ -143,6 +144,8 @@ const gw = await createGateway({
   log: (m) => logLines.push(m),
   tunnelExecutable: FAKE_OK,
   tunnelSpawn: FAKE_OK_TUNNEL.spawnImpl,
+  // pid 文件必须落临时目录：默认落在真实 ~/.dsh 下，会覆盖用户正在运行的隧道 pid
+  tunnelPidFile: path.join(os.tmpdir(), `dsh-ops-${process.pid}.pid`),
 });
 const addr = await gw.start();
 const { port } = addr;

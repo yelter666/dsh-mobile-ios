@@ -286,6 +286,18 @@ check('停服后端口已释放', await portFree(port));
 
 // ---- 12. 插件入口隔离性 ----
 const { apply } = await import('../entries/plugin.mjs');
+// 测试绝不能碰真实用户状态：默认路径下 apply 会写真实日志、读真实设备注册表与隧道状态，
+// 跑一次测试就把用户的配对记录/诊断日志搅乱（实际发生过：日志里混进测试异常）。
+const { mkdtempSync } = await import('node:fs');
+const os = await import('node:os');
+const path = await import('node:path');
+const isolateDir = mkdtempSync(path.join(os.tmpdir(), 'dsh-selftest-'));
+const isolate = {
+  logFile: path.join(isolateDir, 'plugin.log'),
+  pairingFile: path.join(isolateDir, 'devices.json'),
+  // provisioner=state + 空状态文件 → 不碰任何 Cloudflare 凭据，退化成 Quick Tunnel
+  tunnel: { stateFile: path.join(isolateDir, 'tunnel.json'), provisioner: 'state' },
+};
 const cleanups = [];
 // 模拟 Cordis 语义：effect(cb) 会调用 cb，取其返回值作为 disposer
 const stubCtx = {
@@ -296,7 +308,7 @@ const stubCtx = {
   },
   logger: { info: () => {} },
 };
-const handle = apply(stubCtx, { port: PORT + 6, printPairingCode: false });
+const handle = apply(stubCtx, { ...isolate, port: PORT + 6, printPairingCode: false });
 await handle.ready;
 check('插件 apply 返回 ok 且拿到地址', handle.ok === true && handle.address?.port === PORT + 6, JSON.stringify(handle.steps));
 check('插件注册了清理钩子', cleanups.length === 1);
@@ -317,7 +329,7 @@ const brokenCtx = {
 let threw = false;
 let brokenHandle = null;
 try {
-  brokenHandle = apply(brokenCtx, { port: PORT + 7, printPairingCode: false });
+  brokenHandle = apply(brokenCtx, { ...isolate, port: PORT + 7, printPairingCode: false });
 } catch {
   threw = true;
 }
@@ -333,6 +345,14 @@ check('环缓冲下界 = 3（旧帧已丢）', gapRes.resumeFrom === 3, String(g
 check('缺口被如实标记（不猜、不静默）', gapRes.gap === true);
 const okRes = ring.replay({ lastSeq: 4 });
 check('游标有效时只补 1 帧', okRes.frames.length === 1 && okRes.frames[0].seq === 5);
+
+// ---- 收尾：删掉本次隔离目录，别在临时目录里留垃圾 ----
+// Windows 上日志句柄可能还没完全释放，删不掉就放过（不因清理失败判错）。
+try {
+  (await import('node:fs')).rmSync(isolateDir, { recursive: true, force: true });
+} catch {
+  // 忽略：临时目录由系统回收
+}
 
 // ---- 汇总 ----
 console.log(`\n结果：${pass} 通过 / ${failures.length} 失败`);
