@@ -63,7 +63,7 @@ const localStorageStub = (() => {
 const sandbox = {
   window: windowStub, document: documentStub, navigator: navigatorStub,
   console, setTimeout, clearTimeout, setInterval, clearInterval,
-  AbortSignal, fetch: async () => { throw new Error('no network in test'); },
+  AbortSignal, AbortController, fetch: async () => { throw new Error('no network in test'); },
   crypto: { randomUUID: () => `11111111-2222-3333-4444-${String(++uuidSeq).padStart(12, '0')}` },
   localStorage: localStorageStub,
   getComputedStyle: () => ({ backgroundColor: 'rgb(20, 20, 20)' }),
@@ -82,6 +82,7 @@ const exports = captured.factory(sandbox.require);
 const { showUpdateModal, closeUpdateModal, copyToClipboard } = exports.__test;
 const { performUpdate, setPluginManager, setUpdateTimeout, isUpdateInFlight, unwrapRemote } = exports.__test;
 const { restorePendingUpdate, readUpdateState, writeUpdateState, clearUpdateState } = exports.__test;
+const { probe, showDnsHelpModal, copyToClipboard: copyFn, offerManualCopy, showModalToast } = exports.__test;
 check('测试钩子导出跨重载恢复函数', typeof restorePendingUpdate === 'function' && typeof writeUpdateState === 'function');
 check('测试钩子导出对话框函数', typeof showUpdateModal === 'function' && typeof closeUpdateModal === 'function');
 check('测试钩子导出一步更新函数', typeof performUpdate === 'function' && typeof setPluginManager === 'function' && typeof isUpdateInFlight === 'function');
@@ -184,7 +185,7 @@ check('installBundle 传 enabled:true', installArgs?.opts?.enabled === true);
 check('installBundle 传合法 UUID requestId', /^[0-9a-f-]{36}$/i.test(installArgs?.opts?.requestId || ''));
 modal = lastModal();
 check('成功后显示成功横幅', findByText(modal, '✅ 已安装 v0.2.5').length > 0);
-check('需重启时提示重启', findByText(modal, '插件已更新，重启 DSH 桌面端后生效。').length > 0);
+check('需重启时提示重启', findByText(modal, '插件已更新，重启 DSH 桌面端后生效（面板版本号会在重启后变成新版本）。').length > 0);
 check('成功后并发锁已释放', isUpdateInFlight() === false);
 closeUpdateModal();
 
@@ -224,13 +225,53 @@ check('对账成功判为成功横幅', findByText(modal, '✅ 已安装 v0.2.8'
 check('超时对账不重复提交安装', installSubmitCount === 1);
 setUpdateTimeout(180000);
 
-// 降级路径：无 pluginManager → 显示不可用 + 复制入口
+// ② 网关自更新路径：无 pluginManager 时不再把「复制包名」当主路径，
+//    改由本机网关取 npm tarball 安装（这是「既不能一键更新又复制不了」的修法）。
 setPluginManager(null);
-await performUpdate('0.2.7');
+let selfUpdateCalls = 0;
+let selfUpdateBody = null;
+sandbox.fetch = async (url, opts) => {
+  const u = String(url);
+  if (u.includes('/mobile/v1/health')) return { ok: true, json: async () => ({ ok: true }) };
+  if (u.includes('/mobile/v1/desktop/summary')) return { ok: true, json: async () => ({ version: '0.2.7' }) };
+  if (u.includes('/mobile/v1/plugin/self-update')) {
+    selfUpdateCalls += 1;
+    selfUpdateBody = JSON.parse(opts?.body || '{}');
+    return { ok: true, json: async () => ({ ok: true, from: '0.2.7', to: '0.2.8', changed: true, restartRequired: true }) };
+  }
+  throw new Error(`unexpected ${u}`);
+};
+await probe();
+await performUpdate('0.2.8');
 modal = lastModal();
-check('无安装服务显示降级横幅', findByText(modal, '⚠️ 宿主未提供一步更新能力').length > 0);
-check('降级保留复制包名入口', allButtons(modal).some((b) => (b._text || '').includes('复制')));
+check('无宿主服务时改走网关自更新', selfUpdateCalls === 1, `calls=${selfUpdateCalls}`);
+check('自更新请求带目标版本', selfUpdateBody?.target === '0.2.8');
+check('网关自更新成功显示成功横幅', findByText(modal, '✅ 已安装 v0.2.8').length > 0);
+check('网关自更新后提示重启生效', findByText(modal, '插件已更新，重启 DSH 桌面端后生效（面板版本号会在重启后变成新版本）。').length > 0);
 closeUpdateModal();
+
+// 网关自更新失败：给出「复制包名」兜底，且复制失败时暴露可手选的输入框
+sandbox.fetch = async (url) => {
+  const u = String(url);
+  if (u.includes('/mobile/v1/health')) return { ok: true, json: async () => ({ ok: true }) };
+  if (u.includes('/mobile/v1/desktop/summary')) return { ok: true, json: async () => ({ version: '0.2.7' }) };
+  if (u.includes('/mobile/v1/plugin/self-update')) {
+    return { ok: false, json: async () => ({ error: { message: '完整性校验失败' } }) };
+  }
+  throw new Error(`unexpected ${u}`);
+};
+await probe();
+await performUpdate('0.2.8');
+modal = lastModal();
+check('自更新失败显示失败横幅', findByText(modal, '❌ 更新未成功').length > 0);
+check('自更新失败透传原因', findByText(modal, '安装失败：完整性校验失败。可重试，也可以复制包名到「插件 → 添加插件」手动安装。').length > 0);
+const copyBtn = allButtons(modal).find((b) => (b._text || '').includes('复制'));
+check('失败弹窗保留复制包名兜底', Boolean(copyBtn));
+
+// 复位：把网关模拟退回「不可达」，否则上面 probe() 留下的 summary.version
+// 会让后面「更新结果未知」用例误判成「已更新完成」。
+sandbox.fetch = async () => { throw new Error('no network in test'); };
+await probe();
 
 // ── 跨 HMR 重载状态恢复（修复「点击就消失无反应」） ──────────
 console.log('\n跨重载恢复\n');

@@ -129,9 +129,41 @@ export class LocalProvisioner {
       port: s.port ?? null,
       // null = 还没验过（老状态文件）；false = 验过但公网没有——面板必须提示，别让人扫码扫到空气
       dnsOk: s.dnsOk ?? null,
+      dnsCheckedAt: s.dnsCheckedAt ?? null,
       warning: dnsWarningFor(s),
       createdAt: s.createdAt ?? null,
       updatedAt: s.updatedAt ?? null,
+    };
+  }
+
+  /**
+   * 面板「重新检测解析」：强制重探一次并写回状态，不做任何缓存短路。
+   *
+   * 为什么必须有这条路：dnsOk=false 是持久化结论，而面板在 false 时禁用了
+   * 「开启远程」按钮——原来唯一的重探入口就在 ensure() 里，按钮一点就点不到，
+   * 于是 NS 改好了也永远停在「解析异常」，只能删状态文件才恢复（自锁死）。
+   */
+  async recheckDns() {
+    const s = this.state;
+    if (!s?.hostname) return { provisioned: false, ok: false, tampered: false, warning: null, publicNs: [] };
+    const verdict = evaluateDnsAnswer(await this.probe(s.hostname), s.tunnelId);
+    const next = {
+      ...s,
+      dnsOk: verdict.ok,
+      dnsTampered: verdict.tampered,
+      dnsCheckedAt: new Date().toISOString(),
+    };
+    this._state = next;
+    writeState(this.stateFile, next);
+    return {
+      provisioned: true,
+      hostname: next.hostname,
+      ok: Boolean(verdict.ok),
+      tampered: Boolean(verdict.tampered),
+      expected: verdict.expected ?? null,
+      target: verdict.target ?? null,
+      warning: dnsWarningFor(next),
+      checkedAt: next.dnsCheckedAt,
     };
   }
 

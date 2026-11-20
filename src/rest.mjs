@@ -6,6 +6,8 @@ import { translateRecords } from './adapter/session-history.mjs';
 import { createRequire } from 'node:module';
 import { PLUGIN_VERSION } from './version.mjs';
 import { ensureCloudflared, resolveAsset } from './cloudflared-install.mjs';
+import { selfUpdatePlugin } from './plugin-update.mjs';
+import { resolveNs } from './dns-probe.mjs';
 
 // QR 编码（vendor：qrcode-generator 1.4.4，MIT，零依赖；见 lib/vendor/，
 // .cjs 后缀：包为 type:module，require 需显式 CommonJS）
@@ -98,6 +100,8 @@ const DESKTOP_CORS_PATHS = [
   /^\/mobile\/v1\/tunnel\/stop$/,
   /^\/mobile\/v1\/tunnel\/provision$/,
   /^\/mobile\/v1\/tunnel\/install-cloudflared$/,
+  /^\/mobile\/v1\/tunnel\/recheck-dns$/,
+  /^\/mobile\/v1\/plugin\/self-update$/,
 ];
 
 // 面板「插件版本」与更新检查的「当前版本」都取这里；必须与 npm 包版本同源。
@@ -220,9 +224,29 @@ export function createRestRouter({ core, pairing, host, tickets, config = {}, lo
    *   · 进程 running 但没开通 → 只可能是 Quick Tunnel；
    *   · 已开通但进程 stopped → 地址是固定的，但此刻连不上，二维码不能写它。
    */
+  // 「解析异常」曾经是死锁：dnsOk=false 被写进状态文件，面板据此禁用开启按钮，
+  // 而唯一的重探入口就在开启流程里——按钮点不到 → 永远不重探 → NS 改好了也不恢复。
+  // 这里补一层节流自愈：面板轮询 summary 时，若仍是 false 且距上次检查超过 60 秒，
+  // 后台重探一次（不阻塞响应）。用户改完 NS 最多等一分钟就会自己变好。
+  let dnsAutoRecheckAt = 0;
+  let dnsAutoRechecking = false;
+  const maybeAutoRecheckDns = (prov) => {
+    if (!prov || prov.dnsOk !== false) return;
+    if (typeof config.tunnelProvisioner?.recheckDns !== 'function') return;
+    const now = Date.now();
+    if (dnsAutoRechecking || now - dnsAutoRecheckAt < 60_000) return;
+    dnsAutoRecheckAt = now;
+    dnsAutoRechecking = true;
+    Promise.resolve()
+      .then(() => config.tunnelProvisioner.recheckDns())
+      .catch(() => { /* 探测失败保持原状态，不打扰用户 */ })
+      .finally(() => { dnsAutoRechecking = false; });
+  };
+
   const tunnelSnapshot = () => {
     const base = config.tunnel?.status?.() ?? { state: 'disabled', url: null, mode: 'disabled' };
     const prov = config.tunnelProvisioner?.status?.() ?? null;
+    maybeAutoRecheckDns(prov);
     return {
       ...base,
       mode: prov ? 'named' : (base.mode || 'quick'),
@@ -234,6 +258,7 @@ export function createRestRouter({ core, pairing, host, tickets, config = {}, lo
       // 域名在公网上解析得到吗。false 时地址虽在、扫码却连不上（zone pending / NS 没指过来），
       // 面板与二维码都要据此避开它，而不是让用户拿一个必然失败的地址去扫。
       dnsOk: prov?.dnsOk ?? null,
+      dnsCheckedAt: prov?.dnsCheckedAt ?? null,
       warning: prov?.warning ?? null,
       // 面板据此决定是否显示「自动安装 cloudflared」入口：仅在缺失且有官方构建时为 true。
       canAutoInstall: base.executable === 'missing' && !!resolveAsset({}),
@@ -513,6 +538,57 @@ export function createRestRouter({ core, pairing, host, tickets, config = {}, lo
     log(`rest  tunnel install-cloudflared ${result.reused ? '复用' : '已装'} ${result.executable}`);
     // 立即重取状态：findCloudflared 已把组件目录纳入发现链，装完应马上从 missing 变 found。
     return send(ctx.res, 200, { ...result, status: tunnelSnapshot() }, DESKTOP_CORS);
+  });
+
+  /**
+   * 重新检测固定域名的公网解析（面板「重新检测解析」按钮）。
+   *
+   * 存在的唯一理由：dnsOk=false 会持久化，而面板在 false 时曾禁用开启按钮——
+   * 用户把 NS 改对之后没有任何可点的入口让它再验一次。这条路把「自锁死」解开。
+   * 回环-only：探测会真发 DNS 查询，不该让外部触发。
+   */
+  route('POST', /^\/mobile\/v1\/tunnel\/recheck-dns$/, async (ctx) => {
+    loopbackOnly(ctx, '重新检测解析只允许在主机本机操作');
+    const prov = config.tunnelProvisioner;
+    if (!prov) throw fail(4021, '这台主机没有固定地址可检测', { method: 'tunnel.recheckDns' });
+    if (typeof prov.recheckDns !== 'function') throw fail(4021, '当前开通方式不支持重新检测', { method: 'tunnel.recheckDns' });
+    const started = Date.now();
+    const result = await prov.recheckDns();
+    log(`rest  tunnel recheck-dns ok=${result.ok} tampered=${result.tampered} ${Date.now() - started}ms`);
+    // 把公网当前 NS 一并带回去：用户不需要理解 zone/pending，只要拿这串名字去注册商对照。
+    const baseDomain = prov.baseDomain
+      || String(result.hostname || '').split('.').slice(-2).join('.');
+    const publicNs = result.provisioned && baseDomain ? await resolveNs(baseDomain) : [];
+    return send(ctx.res, 200, {
+      ...result,
+      publicNs,
+      status: tunnelSnapshot(),
+    }, DESKTOP_CORS);
+  });
+
+  /**
+   * 插件自更新（不依赖宿主 pluginManager）。
+   *
+   * 为什么放在网关：dsh-app:// 页面里的复制/剪贴板能力不可靠，而「一键更新」缺了宿主
+   * API 就只剩复制包名一条路。这里由 Node 侧直接取 npm tarball、校验 shasum、
+   * 备份后覆盖安装目录，返回 restartRequired 让面板明确告知需要重启。
+   * 只允许装本插件自己（写死包名），不接受任意包/任意 URL。
+   */
+  route('POST', /^\/mobile\/v1\/plugin\/self-update$/, async (ctx) => {
+    loopbackOnly(ctx, '插件更新只允许在主机本机操作');
+    const body = await readJson(ctx.req);
+    const target = typeof body?.target === 'string' && /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(body.target)
+      ? body.target
+      : null;
+    let result;
+    try {
+      result = await selfUpdatePlugin({ target, log });
+    } catch (err) {
+      log(`rest  plugin self-update 失败 ${err?.message || err}`);
+      throw fail(4500, err?.message || '插件更新失败', { code: 'SELF_UPDATE_FAILED' });
+    }
+    log(`rest  plugin self-update ${result.from || '?'} → ${result.to} changed=${result.changed}`);
+    return send(ctx.res, 200, result, DESKTOP_CORS);
   });
 
   // 诊断包（GW-9）：一次拿到可直接粘贴给支持人员的东西。

@@ -109,6 +109,27 @@ class BaseProvisioner {
     return verdict;
   }
 
+  /**
+   * 面板「重新检测解析」：强制重探一次并写回状态，不做缓存短路。
+   * 与 LocalProvisioner.recheckDns 同一契约，面板对两种开通形态一视同仁。
+   */
+  async recheckDns() {
+    const s = this.state;
+    if (!s?.hostname) return { provisioned: false, ok: false, tampered: false, warning: null };
+    const verdict = await this.verifyDns(s.hostname);
+    const now = this.state;
+    return {
+      provisioned: true,
+      hostname: now.hostname,
+      ok: Boolean(verdict.ok),
+      tampered: Boolean(verdict.tampered),
+      expected: verdict.expected ?? null,
+      target: verdict.target ?? null,
+      warning: dnsWarningFor(now),
+      checkedAt: now.dnsCheckedAt ?? null,
+    };
+  }
+
   /** 状态文件里的缓存（读一次后常驻；写穿时同步更新）。 */
   get state() {
     if (this._state === undefined) this._state = loadState(this.stateFile, this.log);
@@ -143,6 +164,7 @@ class BaseProvisioner {
       port: s.port ?? null,
       // null = 还没验过；true/false = 验过且结论明确
       dnsOk: s.dnsOk ?? null,
+      dnsCheckedAt: s.dnsCheckedAt ?? null,
       warning: dnsWarningFor(s),
       createdAt: s.createdAt ?? null,
       updatedAt: s.updatedAt ?? null,
