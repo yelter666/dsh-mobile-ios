@@ -30,7 +30,7 @@
     "start": "node entries/sidecar.mjs --host=mock --dev",
     "start:lan": "node entries/sidecar.mjs --host=mock --dev --lan=true",
     "probe": "node spike0/probe.mjs",
-    "test": "node test/selftest.mjs && node test/ops.mjs && node test/resilience.mjs && node test/borrowed.mjs && node test/mux-table.mjs && node test/live-frames.mjs && node test/artifacts.mjs && node test/attachments.mjs && node test/session-actions.mjs && node test/enhance.mjs && node test/tunnel-named.mjs"
+    "test": "node test/selftest.mjs && node test/version.mjs && node test/ops.mjs && node test/resilience.mjs && node test/borrowed.mjs && node test/mux-table.mjs && node test/live-frames.mjs && node test/artifacts.mjs && node test/attachments.mjs && node test/session-actions.mjs && node test/enhance.mjs && node test/tunnel-named.mjs"
   },
   "dsh": {
     "bundle": {
