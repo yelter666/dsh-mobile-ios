@@ -303,5 +303,25 @@ check('超时未生效弹「更新结果未知」', findByText(modal, '⚠️ �
 check('恢复后清理了持久化状态', readUpdateState() === null);
 closeUpdateModal();
 
+// ── 域名解析异常排障弹窗（解「暂不可开启」死胡同） ──────────
+console.log('\n域名解析排障弹窗\n');
+closeUpdateModal();
+showDnsHelpModal({ ok: false, publicNs: ['davina.ns.cloudflare.com', 'trace.ns.cloudflare.com'] });
+modal = lastModal();
+check('弹窗标题点明未生效', findByText(modal, '域名暂未生效').length > 0);
+check('横幅给出解析不到', findByText(modal, '⚠️ 公网解析不到这个地址').length > 0);
+check('列出公网 NS 供对照', findByText(modal, 'davina.ns.cloudflare.com / trace.ns.cloudflare.com').length > 0);
+check('给出可执行步骤（不是只报异常）',
+  findByText(modal, '到 Cloudflare 后台看该域名：若状态是「待激活 / Pending」，说明公网 NS 还没指向这个账号。').length > 0);
+check('提供「重新检测」主按钮', allButtons(modal).some((b) => b._text === '重新检测'));
+closeUpdateModal();
+
+// CNAME 被改指：文案要换成更危险的那一类
+showDnsHelpModal({ ok: false, tampered: true });
+modal = lastModal();
+check('改指时标题为「固定域名被改指」', findByText(modal, '固定域名被改指').length > 0);
+check('改指时提示网关拒绝下发', findByText(modal, '⚠️ CNAME 已不指向本机隧道').length > 0);
+closeUpdateModal();
+
 console.log(`\n结果：${pass} 通过 / ${failures.length} 失败`);
 if (failures.length) process.exit(1);
