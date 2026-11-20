@@ -316,6 +316,82 @@ console.log('\n9) 生产接线：createProvisioner 必须真的挂上归因与�
   check('local 开通器拿到了地址归属查询', typeof p?.ownerLookup === 'function');
 }
 
+console.log('\n10) 授权账号变更：重建隧道但保留同一个固定地址\n');
+{
+  // 真实场景：域名从账号 A 迁到账号 B，本机重新 cloudflared tunnel login。
+  // 状态文件里还留着 A 的 tunnelId —— 直接拿去 route dns 会 "tunnel not found"。
+  const home = path.join(tmp, 'home-account-switch');
+  const cfDir = path.join(home, '.cloudflared');
+  fs.mkdirSync(cfDir, { recursive: true });
+  fs.writeFileSync(path.join(cfDir, 'cert.pem'), fakeCert({ accountId: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', zoneId: 'ffffffffffffffffffffffffffffffff' }));
+  const oldTunnel = '99999999-8888-7777-6666-555555555555';
+  const newTunnel = '12121212-3434-5656-7878-909090909090';
+  const stateFile = path.join(home, 'tunnel-named.json');
+  fs.writeFileSync(stateFile, JSON.stringify({
+    version: 1,
+    installationId: 'abc',
+    account: ACCOUNT_ID, // 旧账号
+    subdomain: 'dsh-keepme0000',
+    hostname: 'dsh-keepme0000.matrixboard.cn',
+    tunnelId: oldTunnel,
+    credentialsFile: path.join(cfDir, `${oldTunnel}.json`),
+    configFile: path.join(home, 'tunnel-config.yml'),
+    port: 3081,
+    dnsOk: false,
+  }));
+  fs.writeFileSync(path.join(cfDir, `${oldTunnel}.json`), '{}', { mode: 0o600 });
+
+  const calls = [];
+  const p = new LocalProvisioner({
+    baseDomain: 'matrixboard.cn',
+    seed: 'install-switch',
+    stateFile,
+    configFile: path.join(home, 'tunnel-config.yml'),
+    homeDir: home,
+    log: () => {},
+    run: async (args) => {
+      calls.push(args.join(' '));
+      if (args[1] === 'list') return '[]'; // 新账号里没有任何隧道
+      if (args[1] === 'create') {
+        fs.writeFileSync(path.join(cfDir, `${newTunnel}.json`), '{}', { mode: 0o600 });
+        return `INF Created tunnel ${args[2]} with id ${newTunnel}`;
+      }
+      return 'INF Added CNAME';
+    },
+    probe: async () => ({ ok: true, kind: 'CNAME', records: [`${newTunnel}.cfargotunnel.com`] }),
+    ownerLookup: async () => null,
+  });
+
+  const r = await p.ensure({ port: 3081 });
+  const st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  check('账号变更后重建了隧道（没沿用旧 id）', st.tunnelId === newTunnel, st.tunnelId);
+  check('调用了 tunnel create', calls.some((c) => c.startsWith('tunnel create')), calls.join(' | '));
+  check('固定地址保持不变（子域沿用）', r.hostname === 'dsh-keepme0000.matrixboard.cn', r.hostname);
+  check('状态文件记下新账号，下次变更才认得出来', st.account === 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+  check('重建后照常写 DNS', calls.some((c) => c.includes('route dns') && c.includes('dsh-keepme0000')), calls.join(' | '));
+  check('新隧道凭据路径已更新', st.credentialsFile.endsWith(`${newTunnel}.json`), st.credentialsFile);
+
+  // 同一账号再次启动：不该无谓重建
+  const again = new LocalProvisioner({
+    baseDomain: 'matrixboard.cn',
+    seed: 'install-switch',
+    stateFile,
+    configFile: path.join(home, 'tunnel-config.yml'),
+    homeDir: home,
+    log: () => {},
+    run: async (args) => {
+      calls.push(args.join(' '));
+      return args[1] === 'list' ? '[]' : 'INF ok';
+    },
+    probe: async () => ({ ok: true, kind: 'CNAME', records: [`${newTunnel}.cfargotunnel.com`] }),
+  });
+  const before = calls.length;
+  // 端口变化走「只重写 ingress」的快路径，能直接验证没有重开隧道
+  await again.ensure({ port: 3082 });
+  check('账号未变时不重建隧道', JSON.parse(fs.readFileSync(stateFile, 'utf8')).tunnelId === newTunnel);
+  check('账号未变时不调用 create', !calls.slice(before).some((c) => c.startsWith('tunnel create')), calls.slice(before).join(' | '));
+}
+
 fs.rmSync(tmp, { recursive: true, force: true });
 
 console.log(`\n结果：${pass} 通过 / ${failures.length} 失败\n`);

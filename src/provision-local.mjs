@@ -23,7 +23,7 @@ import { promisify } from 'node:util';
 import { fail } from './protocol.mjs';
 import { deriveSubdomain, isValidLabel } from './dns-label.mjs';
 import { dnsWarningFor, evaluateDnsAnswer, probeDns, resolveNs } from './dns-probe.mjs';
-import { cnameBelongsTo } from './zone-health.mjs';
+import { cnameBelongsTo, readZoneCert } from './zone-health.mjs';
 
 const execFileAsync = promisify(nodeExecFile);
 const CLI_TIMEOUT_MS = 45_000;
@@ -268,8 +268,30 @@ export class LocalProvisioner {
 
   async ensure({ port, force = false } = {}) {
     if (!Number.isInteger(port) || port <= 0) throw fail(4400, '开通隧道需要有效端口');
-    const cached = this.state;
-    if (!force && cached?.hostname && cached.port === port) {
+    // 授权账号可能变过（域名迁移到另一个 Cloudflare 账号后重新 login 就是这种情况）：
+    // 旧 tunnel 属于上一个账号，继续拿它的 id 去 route dns 只会得到
+    // "tunnel not found" 或更糟的静默失败。账号变了就当新装：重建隧道、保留同一个子域
+    // （地址不变，用户不用重新记/重新扫）。
+    const account = readZoneCert({ homeDir: this.homeDir })?.accountId || null;
+    let cached = this.state;
+    let accountChanged = false;
+    if (cached?.account && account && cached.account !== account) {
+      this.log(`tunnel 授权账号已变更（${cached.account.slice(0, 8)}… → ${account.slice(0, 8)}…），重建隧道`);
+      accountChanged = true;
+      cached = {
+        ...cached,
+        account,
+        tunnelId: null,
+        credentialsFile: null,
+        configFile: null,
+        dnsOk: null,
+        dnsTampered: false,
+        zone: null,
+      };
+    }
+    // 账号变了就必须走完整开通：缓存里的 port/hostname 看着都可用，
+    // 但它们描述的是上一个账号的隧道，跳过缓存才不会「解析通了就以为没事」。
+    if (!force && !accountChanged && cached?.hostname && cached.port === port) {
       // 与 BaseProvisioner 同策略：没确认过就现场验一次（含防篡改评估）
       if (cached.dnsOk !== true) {
         const { verdict, zone } = await this.#evaluate(cached.hostname, cached.tunnelId);
@@ -404,6 +426,8 @@ export class LocalProvisioner {
     const next = {
       ...cached,
       installationId,
+      // 记下这本证书属于哪个 Cloudflare 账号：下次若换了账号，能识别出「旧隧道不再可用」
+      account: account || cached?.account || null,
       subdomain: label,
       hostname,
       tunnelId,
