@@ -189,6 +189,48 @@ check('需重启时提示重启', findByText(modal, '插件已更新，重启 DS
 check('成功后并发锁已释放', isUpdateInFlight() === false);
 closeUpdateModal();
 
+// 宿主升级入口：已安装的包必须走 updateBundle（与「插件」页「更新到 vX」同一条路径）
+// 用 installBundle 会被宿主判「该插件已安装」，正是「点了没反应」的根因。
+let updateArgs = null;
+let installCalledDespiteUpdate = false;
+setPluginManager({
+  updateBundle: async (name, version, opts) => {
+    updateArgs = { name, version, opts };
+    return { from: '0.2.4', to: version, step: 'install', result: { changed: true, application: 'applied' } };
+  },
+  installBundle: async () => { installCalledDespiteUpdate = true; return { ok: true, value: {} }; },
+});
+await performUpdate('0.2.5');
+modal = lastModal();
+check('优先调用宿主 updateBundle（包名 + 目标版本）', updateArgs?.name === 'dsh-mobile-ios' && updateArgs?.version === '0.2.5');
+check('updateBundle 传合法 UUID requestId', /^[0-9a-f-]{36}$/i.test(updateArgs?.opts?.requestId || ''));
+check('有 updateBundle 时不再调 installBundle', installCalledDespiteUpdate === false);
+check('updateBundle 成功后显示成功横幅', findByText(modal, '✅ 已安装 v0.2.5').length > 0);
+closeUpdateModal();
+
+// 宿主拒绝升级（application:'failed'）：必须判失败，不能吞成成功
+setPluginManager({
+  updateBundle: async (name, version) => ({
+    from: '0.2.4', to: version, step: 'check',
+    result: {
+      changed: false, application: 'failed', stage: 'install', target: name,
+      error: { code: 'invalid-spec', diagnostic: '0.2.5 is not a version newer than the installed 0.2.5' },
+    },
+  }),
+});
+await performUpdate('0.2.5');
+modal = lastModal();
+check('宿主拒绝时判为失败', findByText(modal, '❌ 面板内更新未成功').length > 0);
+check('失败原因取宿主 diagnostic', (() => {
+  let found = false;
+  const walk = (el) => { if ((el._text || '').includes('not a version newer')) found = true; (el.children || []).forEach(walk); };
+  walk(modal); return found;
+})());
+check('失败弹窗给出插件页刷新步骤', findByText(modal, '在 DSH 左侧点「插件」').length > 0);
+check('失败弹窗标出「刷新」按钮位置', findByText(modal, '点右上角「刷新」').length > 0);
+check('失败弹窗仍有重试入口', allButtons(modal).some((b) => b._text === '重试更新'));
+closeUpdateModal();
+
 // 失败路径：installBundle 抛出 → 失败横幅 + 重试入口
 setPluginManager({
   installBundle: async () => { throw new Error('网络中断'); },
@@ -196,7 +238,7 @@ setPluginManager({
 });
 await performUpdate('0.2.6');
 modal = lastModal();
-check('失败后显示失败横幅', findByText(modal, '❌ 更新未成功').length > 0);
+check('失败后显示失败横幅', findByText(modal, '❌ 面板内更新未成功').length > 0);
 check('失败后含重试按钮', allButtons(modal).some((b) => b._text === '重试更新'));
 check('失败原因透传到文案', (() => {
   let found = false;
@@ -263,8 +305,8 @@ sandbox.fetch = async (url) => {
 await probe();
 await performUpdate('0.2.8');
 modal = lastModal();
-check('自更新失败显示失败横幅', findByText(modal, '❌ 更新未成功').length > 0);
-check('自更新失败透传原因', findByText(modal, '安装失败：完整性校验失败。可重试，也可以复制包名到「插件 → 添加插件」手动安装。').length > 0);
+check('自更新失败显示失败横幅', findByText(modal, '❌ 面板内更新未成功').length > 0);
+check('自更新失败透传原因', findByText(modal, '失败原因：完整性校验失败。可重试；更稳的办法是到「插件」页刷新，由 DSH 自己安装。').length > 0);
 const copyBtn = allButtons(modal).find((b) => (b._text || '').includes('复制'));
 check('失败弹窗保留复制包名兜底', Boolean(copyBtn));
 
