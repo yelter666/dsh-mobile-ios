@@ -22,7 +22,8 @@ import path from 'node:path';
 import { fail } from './protocol.mjs';
 import { deriveSubdomain, isValidLabel } from './dns-label.mjs';
 import { DNS_PENDING_HINT, DNS_TAMPER_HINT, dnsWarningFor, evaluateDnsAnswer, probeDns } from './dns-probe.mjs';
-import { LocalProvisioner } from './provision-local.mjs';
+import { LocalProvisioner, sanitizeZone } from './provision-local.mjs';
+import { diagnoseZone, findDnsOwner, ZONE_STATUS_HINT } from './zone-health.mjs';
 
 // 兼容既有调用方与测试：子域规则从 dns-label.mjs 来，这里一并导出
 export { deriveSubdomain, isValidLabel };
@@ -72,13 +73,16 @@ function saveState(file, state) {
 }
 
 class BaseProvisioner {
-  constructor({ stateFile = null, log = () => {}, baseDomain = 'matrixboard.cn', probe = null } = {}) {
+  constructor({ stateFile = null, log = () => {}, baseDomain = 'matrixboard.cn', probe = null, zoneDiagnose = null } = {}) {
     this.stateFile = stateFile;
     this.log = log;
     this.baseDomain = String(baseDomain).replace(/^\./, '').toLowerCase();
     this._state = undefined; // undefined=未读；null=没有
     // 可注入：测试里不该真发 DNS 查询（依赖外网且要等重试）
     this.probe = probe || probeDns;
+    // 解析失败时进一步归因（moved / pending / ns-mismatch）；不注入就只报「解析不到」
+    this.zoneDiagnose = zoneDiagnose;
+    this._zone = null;
   }
 
   /**
@@ -96,8 +100,25 @@ class BaseProvisioner {
     // 记录若被人改指到别的隧道/服务器，解析照样「成功」，流量却会落到对方 ingress——
     // 这时按「地址不可用」处理，绝不下发。
     const verdict = evaluateDnsAnswer(check, current?.tunnelId);
+    // 解析不到时再问一句「这域名现在归谁」：moved（被别的账号接管）与 pending（NS 还没指过来）
+    // 的修法完全不同，笼统一句「等 NS 生效」会让人白等。
+    let zone = null;
+    if (!verdict.ok && typeof this.zoneDiagnose === 'function') {
+      try {
+        zone = sanitizeZone(await this.zoneDiagnose({ baseDomain: this.baseDomain, dnsOk: false }));
+      } catch {
+        zone = null;
+      }
+      this._zone = zone;
+    }
     if (current && current.hostname === hostname) {
-      this.#persist({ ...current, dnsOk: verdict.ok, dnsTampered: verdict.tampered, dnsCheckedAt: new Date().toISOString() });
+      this.#persist({
+        ...current,
+        dnsOk: verdict.ok,
+        dnsTampered: verdict.tampered,
+        dnsCheckedAt: new Date().toISOString(),
+        zone,
+      });
     }
     if (verdict.tampered) {
       this.log(`tunnel 警告 固定地址解析被改指 ${hostname} → ${verdict.target}（期望 ${verdict.expected}），拒绝下发该地址`);
@@ -115,7 +136,7 @@ class BaseProvisioner {
    */
   async recheckDns() {
     const s = this.state;
-    if (!s?.hostname) return { provisioned: false, ok: false, tampered: false, warning: null };
+    if (!s?.hostname) return { provisioned: false, ok: false, tampered: false, warning: null, zone: null };
     const verdict = await this.verifyDns(s.hostname);
     const now = this.state;
     return {
@@ -127,6 +148,7 @@ class BaseProvisioner {
       target: verdict.target ?? null,
       warning: dnsWarningFor(now),
       checkedAt: now.dnsCheckedAt ?? null,
+      zone: now.zone ?? this._zone ?? null,
     };
   }
 
@@ -165,6 +187,7 @@ class BaseProvisioner {
       // null = 还没验过；true/false = 验过且结论明确
       dnsOk: s.dnsOk ?? null,
       dnsCheckedAt: s.dnsCheckedAt ?? null,
+      zone: s.zone ?? this._zone ?? null,
       warning: dnsWarningFor(s),
       createdAt: s.createdAt ?? null,
       updatedAt: s.updatedAt ?? null,
@@ -266,8 +289,9 @@ export class CloudflareProvisioner extends BaseProvisioner {
     apiBase = CF_API_BASE,
     log = () => {},
     probe = null,
+    zoneDiagnose = null,
   } = {}) {
-    super({ stateFile, log, baseDomain, probe });
+    super({ stateFile, log, baseDomain, probe, zoneDiagnose });
     this.apiToken = apiToken;
     this.accountId = accountId;
     this.zoneId = zoneId;
@@ -275,6 +299,15 @@ export class CloudflareProvisioner extends BaseProvisioner {
     this.seed = seed;
     this.fetchImpl = fetchImpl;
     this.apiBase = String(apiBase).replace(/\/$/, '');
+    // API 形态本身就有 zone 级凭据，不必借 cert.pem：解析失败时直接问清 zone 现状
+    this.zoneDiagnose = zoneDiagnose || ((args = {}) => diagnoseZone({
+      ...args,
+      apiToken: this.apiToken,
+      zoneId: this.zoneId,
+      baseDomain: args.baseDomain || this.baseDomain,
+      fetchImpl: this.fetchImpl,
+      apiBase: this.apiBase,
+    }));
   }
 
   get kind() {
@@ -361,8 +394,17 @@ export class CloudflareProvisioner extends BaseProvisioner {
       });
     }
     if (zone.status && zone.status !== 'active') {
-      throw fail(4021, `域名 ${this.baseDomain} 在 Cloudflare 侧状态为 ${zone.status}`, {
-        detail: '等域名状态变成 active 后再开通（NS 尚未生效时隧道域名不会被解析）',
+      // 状态不同，修法完全不同：moved 说明域名已被另一个 Cloudflare 账号接管，
+      // 在本账号重试一万次也不会生效；pending 只是 NS 还没指过来。
+      const hint = ZONE_STATUS_HINT[zone.status] || `状态 ${zone.status}`;
+      const ns = (zone.name_servers || []).join(' / ') || '(当前账号未分配)';
+      throw fail(4021, `域名 ${this.baseDomain} 未生效：${hint}`, {
+        detail: zone.status === 'moved'
+          ? `本账号分配的公网 NS 是 ${ns}。域名现在被另一个 Cloudflare 账号接管，本账号写入的记录不会下发——`
+            + '要么在注册商把 NS 改回这一对，要么统一只用同一个 Cloudflare 账号登录（两边互斥，只能二选一）。'
+          : `本账号分配的公网 NS 是 ${ns}；到域名注册商把 NS 改成这一对，生效后再开通。`,
+        zoneStatus: zone.status,
+        expectedNs: zone.name_servers || [],
       });
     }
     this.zoneId = zone.id;
@@ -626,6 +668,9 @@ export function createProvisioner(config = {}, { log = () => {}, stateFile = nul
       configFile: config.configFile || null,
       seed: config.seed || null,
       log,
+      // 生产路径才接真实探测：测试直接 new LocalProvisioner 时保持零网络依赖
+      zoneDiagnose: diagnoseZone,
+      ownerLookup: findDnsOwner,
     });
   }
   if (kind === 'state') {

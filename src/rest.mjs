@@ -259,6 +259,9 @@ export function createRestRouter({ core, pairing, host, tickets, config = {}, lo
       // 面板与二维码都要据此避开它，而不是让用户拿一个必然失败的地址去扫。
       dnsOk: prov?.dnsOk ?? null,
       dnsCheckedAt: prov?.dnsCheckedAt ?? null,
+      // 解析失败的归因（moved / pending / ns-mismatch / unresolved）：
+      // 面板据此给**不同**的修法，而不是一律「等 NS 生效」。
+      zone: prov?.zone ?? null,
       warning: prov?.warning ?? null,
       // 面板据此决定是否显示「自动安装 cloudflared」入口：仅在缺失且有官方构建时为 true。
       canAutoInstall: base.executable === 'missing' && !!resolveAsset({}),

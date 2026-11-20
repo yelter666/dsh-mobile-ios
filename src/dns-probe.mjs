@@ -10,8 +10,21 @@
 
 import dns from 'node:dns';
 
-export const DNS_PENDING_HINT = '域名在当前 Cloudflare 账号里未生效（zone 处于 pending，公网 NS 指向另一份 zone）。'
+export const DNS_PENDING_HINT = '域名在当前 Cloudflare 账号里还没生效（zone pending）：公网 NS 指向的是另一份 zone。'
   + '要么把这个域名的 NS 改成该账号分配的 nameserver，要么换用持有生效 zone 的账号重新登录授权。';
+
+// 本账号的 zone 已被另一个 Cloudflare 账号接管（status=moved）。这时改本账号的
+// 记录、重装插件、重启隧道统统没用——公网根本不读这份 zone，必须动注册商 NS 或换账号。
+export const DNS_MOVED_HINT = '域名已被另一个 Cloudflare 账号接管（zone moved）：本机写入的记录不会下发到公网。'
+  + '在域名注册商处把 NS 改回本账号分配的一对，或统一只用同一个 Cloudflare 账号登录。';
+
+export const DNS_NS_MISMATCH_HINT = '域名在本账号显示已生效，但公网 NS 与本账号分配的不一致，记录暂时查不到。'
+  + '确认注册商处两处 NS 都已改完，再点「重新检测」。';
+
+// zone 已 active、NS 也对，公网却还是没有这条记录：多半是刚写入的记录还在传播，
+// 或者记录被手动删了。这时重装/重开都没意义，等一下再重检即可。
+export const DNS_UNRESOLVED_HINT = '域名在 Cloudflare 已生效，但公网暂时查不到这台主机的记录：'
+  + '记录可能刚写入（等 1–2 分钟），或已被删除。稍后点「重新检测」，仍不行就重新「开启远程」重建记录。';
 
 // 防劫持：CNAME 没有指向本机隧道。解析「成功」但流量会落到别人的 ingress，
 // 扫码连接等于把指令发给未知服务器——必须当作地址不可用处理。
@@ -33,11 +46,18 @@ export function evaluateDnsAnswer(check, tunnelId) {
   return { ...check, ok: Boolean(check?.ok) && !tampered, tampered, target, expected };
 }
 
-/** 状态 → 面板提示。篡改优先于 pending：两者都真时，先让人处理更危险的那个。 */
+/** 状态 → 面板提示。篡改优先于 zone 故障：两者都真时，先让人处理更危险的那个。 */
 export function dnsWarningFor(state) {
   if (state?.dnsTampered) return DNS_TAMPER_HINT;
-  if (state?.dnsOk === false) return DNS_PENDING_HINT;
-  return null;
+  if (state?.dnsOk !== false) return null;
+  // zone 层面已经诊断出结论时，用结论而不是笼统的「pending」——
+  // moved / pending / ns-mismatch 的修法完全不同，猜错等于让人白跑一趟。
+  const code = state?.zone?.code;
+  if (code === 'moved') return DNS_MOVED_HINT;
+  if (code === 'ns-mismatch') return DNS_NS_MISMATCH_HINT;
+  if (code === 'unresolved') return DNS_UNRESOLVED_HINT;
+  if (code === 'pending') return DNS_PENDING_HINT;
+  return DNS_PENDING_HINT;
 }
 
 /**

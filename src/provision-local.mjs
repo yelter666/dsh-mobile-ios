@@ -22,7 +22,8 @@ import { execFile as nodeExecFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fail } from './protocol.mjs';
 import { deriveSubdomain, isValidLabel } from './dns-label.mjs';
-import { dnsWarningFor, evaluateDnsAnswer, probeDns } from './dns-probe.mjs';
+import { dnsWarningFor, evaluateDnsAnswer, probeDns, resolveNs } from './dns-probe.mjs';
+import { cnameBelongsTo } from './zone-health.mjs';
 
 const execFileAsync = promisify(nodeExecFile);
 const CLI_TIMEOUT_MS = 45_000;
@@ -66,6 +67,26 @@ export function renderConfig({ tunnelId, credentialsFile, hostname, port }) {
   ].join('\n');
 }
 
+/**
+ * zone 诊断结果的**展示副本**：只留结论与 NS 名字。
+ *
+ * zoneId / accountId 这类内部标识一律不落状态文件、不进面板——
+ * 面板只需要知道「归谁、对不对」，不需要也不该拿到账号坐标。
+ */
+export function sanitizeZone(zone) {
+  if (!zone || typeof zone !== 'object') return null;
+  const list = (v) => (Array.isArray(v) ? v.map((x) => String(x).toLowerCase()).filter(Boolean).slice(0, 4) : []);
+  return {
+    code: zone.code || 'unknown',
+    status: zone.status || null,
+    expectedNs: list(zone.expectedNs),
+    publicNs: list(zone.publicNs),
+    zoneName: zone.zoneName || null,
+    accountName: zone.accountName || null,
+    checkedAt: new Date().toISOString(),
+  };
+}
+
 export class LocalProvisioner {
   constructor({
     baseDomain = 'matrixboard.cn',
@@ -79,6 +100,11 @@ export class LocalProvisioner {
     run = null,
     // 可注入：测试里不该真发 DNS 查询（会等 NXDOMAIN 重试，还依赖外网）
     probe = null,
+    // 可注入：解析失败时进一步问「这个域名现在归哪个 Cloudflare 账号」。
+    // 不注入就不诊断（测试/离线场景保持零网络依赖）；生产由 createProvisioner 注入。
+    zoneDiagnose = null,
+    // 可注入：开通前查这条 hostname 现在指向哪条隧道，避免多机互相覆盖。
+    ownerLookup = null,
   } = {}) {
     this.baseDomain = String(baseDomain).replace(/^\./, '').toLowerCase();
     this.prefix = prefix;
@@ -92,6 +118,9 @@ export class LocalProvisioner {
     // 可注入，测试里不必真起 cloudflared
     this.run = run || this.#exec;
     this.probe = probe || probeDns;
+    this.zoneDiagnose = zoneDiagnose;
+    this.ownerLookup = ownerLookup;
+    this._zone = null; // 最近一次 zone 诊断结论（不含凭据）
   }
 
   get kind() {
@@ -117,6 +146,43 @@ export class LocalProvisioner {
     return `在这台电脑的终端执行：${this.executable} tunnel login（浏览器里选 matrixboard.cn 授权）`;
   }
 
+  /** 公网当前 NS（查询失败就当没有：少一句提示不该让整条诊断崩掉）。 */
+  async #publicNs() {
+    try {
+      return await resolveNs(this.baseDomain);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * 解析自检 + （失败时）zone 归因。
+   *
+   * 只把「解析不到」当作需要归因的信号：解析成功时多问一次 Cloudflare 只是浪费
+   * 一次往返，而失败时那句笼统的「pending」正是把人带偏的根源——域名可能已经被
+   * 另一个 Cloudflare 账号接管（zone moved），改 NS、重装、重启都不可能修好。
+   */
+  async #evaluate(hostname, tunnelId) {
+    const verdict = evaluateDnsAnswer(await this.probe(hostname), tunnelId);
+    if (verdict.ok || typeof this.zoneDiagnose !== 'function') {
+      this._zone = null; // 通了就别留着上一次的故障结论
+      return { verdict, zone: null };
+    }
+    let zone = null;
+    try {
+      zone = sanitizeZone(await this.zoneDiagnose({
+        homeDir: this.homeDir,
+        baseDomain: this.baseDomain,
+        publicNs: await this.#publicNs(),
+        dnsOk: false,
+      }));
+    } catch {
+      zone = null; // 「不知道」比「猜一个」诚实
+    }
+    this._zone = zone;
+    return { verdict, zone };
+  }
+
   status() {
     const s = this.state;
     if (!s) return { kind: 'local', provisioned: false, hostname: null, url: null, tunnelId: null };
@@ -130,6 +196,9 @@ export class LocalProvisioner {
       // null = 还没验过（老状态文件）；false = 验过但公网没有——面板必须提示，别让人扫码扫到空气
       dnsOk: s.dnsOk ?? null,
       dnsCheckedAt: s.dnsCheckedAt ?? null,
+      // 失败原因归到 zone 层（moved / pending / ns-mismatch / unresolved），
+      // 面板据此给出**不同**的修法，而不是一律「等 NS 生效」。
+      zone: s.zone ?? this._zone ?? null,
       warning: dnsWarningFor(s),
       createdAt: s.createdAt ?? null,
       updatedAt: s.updatedAt ?? null,
@@ -145,13 +214,14 @@ export class LocalProvisioner {
    */
   async recheckDns() {
     const s = this.state;
-    if (!s?.hostname) return { provisioned: false, ok: false, tampered: false, warning: null, publicNs: [] };
-    const verdict = evaluateDnsAnswer(await this.probe(s.hostname), s.tunnelId);
+    if (!s?.hostname) return { provisioned: false, ok: false, tampered: false, warning: null, publicNs: [], zone: null };
+    const { verdict, zone } = await this.#evaluate(s.hostname, s.tunnelId);
     const next = {
       ...s,
       dnsOk: verdict.ok,
       dnsTampered: verdict.tampered,
       dnsCheckedAt: new Date().toISOString(),
+      zone,
     };
     this._state = next;
     writeState(this.stateFile, next);
@@ -164,6 +234,7 @@ export class LocalProvisioner {
       target: verdict.target ?? null,
       warning: dnsWarningFor(next),
       checkedAt: next.dnsCheckedAt,
+      zone,
     };
   }
 
@@ -201,8 +272,14 @@ export class LocalProvisioner {
     if (!force && cached?.hostname && cached.port === port) {
       // 与 BaseProvisioner 同策略：没确认过就现场验一次（含防篡改评估）
       if (cached.dnsOk !== true) {
-        const verdict = evaluateDnsAnswer(await this.probe(cached.hostname), cached.tunnelId);
-        const next = { ...cached, dnsOk: verdict.ok, dnsTampered: verdict.tampered, dnsCheckedAt: new Date().toISOString() };
+        const { verdict, zone } = await this.#evaluate(cached.hostname, cached.tunnelId);
+        const next = {
+          ...cached,
+          dnsOk: verdict.ok,
+          dnsTampered: verdict.tampered,
+          dnsCheckedAt: new Date().toISOString(),
+          zone,
+        };
         this._state = next;
         writeState(this.stateFile, next);
         return {
@@ -212,6 +289,7 @@ export class LocalProvisioner {
           created: false,
           changed: false,
           dnsOk: next.dnsOk,
+          zone,
           warning: dnsWarningFor(next),
         };
       }
@@ -278,6 +356,25 @@ export class LocalProvisioner {
       });
     }
 
+    // 多机共用同一个 Cloudflare 账号时，`--overwrite-dns` 会**静默**把别人的地址抢走：
+    // A 机本来能用，B 机一开通 A 机就断，两边面板却都显示「成功」。
+    // 有凭据就先看这条 hostname 现在归谁，抢址直接报错，绝不静默覆盖。
+    if (typeof this.ownerLookup === 'function') {
+      let owner = null;
+      try {
+        owner = await this.ownerLookup({ homeDir: this.homeDir, baseDomain: this.baseDomain, hostname });
+      } catch {
+        owner = null; // 查不到归属时退回旧行为，别让诊断把开通卡死
+      }
+      if (owner && !cnameBelongsTo(owner, tunnelId)) {
+        this.log(`tunnel 拒绝覆盖 ${hostname}：当前指向 ${owner}，本机隧道 ${tunnelId}`);
+        throw fail(4021, `固定地址 ${hostname} 已被另一条隧道占用`, {
+          detail: `该地址当前指向 ${owner}。通常是另一台电脑用了同一份安装标识（或状态文件被复制）。`
+            + '本机已停止覆盖它：请在那台设备上重新开通以换一个地址，或先删掉这条 DNS 记录再重试。',
+        });
+      }
+    }
+
     // --overwrite-dns：重复开通时把记录改到当前 tunnel，而不是报「已存在」
     try {
       await this.run(['tunnel', 'route', 'dns', '--overwrite-dns', label, hostname]);
@@ -292,10 +389,10 @@ export class LocalProvisioner {
     try { fs.chmodSync(this.configFile, 0o600); } catch { /* 已 0600 */ }
 
     const now = new Date().toISOString();
-    // 开通即自检：DNS 写成功 ≠ 公网能解析（pending zone 就是这么骗人的）；
+    // 开通即自检：DNS 写成功 ≠ 公网能解析（pending / moved zone 就是这么骗人的）；
     // CNAME 被改指到别的隧道同样不放行（防劫持评估见 dns-probe.evaluateDnsAnswer）
-    const verdict = evaluateDnsAnswer(await this.probe(hostname), tunnelId);
-    const warning = dnsWarningFor({ dnsOk: verdict.ok, dnsTampered: verdict.tampered });
+    const { verdict, zone } = await this.#evaluate(hostname, tunnelId);
+    const warning = dnsWarningFor({ dnsOk: verdict.ok, dnsTampered: verdict.tampered, zone });
     if (verdict.tampered) {
       this.log(`tunnel 警告 固定地址解析被改指 ${hostname} → ${verdict.target}（期望 ${verdict.expected}），拒绝下发该地址`);
     } else if (verdict.ok) {
@@ -316,6 +413,7 @@ export class LocalProvisioner {
       dnsOk: verdict.ok,
       dnsTampered: verdict.tampered,
       dnsCheckedAt: now,
+      zone,
       createdAt: cached?.createdAt ?? now,
       updatedAt: now,
     };
@@ -329,6 +427,7 @@ export class LocalProvisioner {
       created,
       changed: Boolean(cached && cached.hostname !== hostname),
       dnsOk: verdict.ok,
+      zone,
       warning,
     };
   }

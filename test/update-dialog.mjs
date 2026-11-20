@@ -312,8 +312,44 @@ check('弹窗标题点明未生效', findByText(modal, '域名暂未生效').len
 check('横幅给出解析不到', findByText(modal, '⚠️ 公网解析不到这个地址').length > 0);
 check('列出公网 NS 供对照', findByText(modal, 'davina.ns.cloudflare.com / trace.ns.cloudflare.com').length > 0);
 check('给出可执行步骤（不是只报异常）',
-  findByText(modal, '到 Cloudflare 后台看该域名：若状态是「待激活 / Pending」，说明公网 NS 还没指向这个账号。').length > 0);
+  findByText(modal, '到 Cloudflare 后台看该域名状态是否为「活动 / Active」。').length > 0);
 check('提供「重新检测」主按钮', allButtons(modal).some((b) => b._text === '重新检测'));
+closeUpdateModal();
+
+// zone 被另一个 Cloudflare 账号接管（moved）：这是「改 NS 也改不对」的那类，
+// 文案必须点明归属冲突，并把本账号期望 NS 与公网 NS 并排列出来供对照。
+showDnsHelpModal({
+  ok: false,
+  publicNs: ['davina.ns.cloudflare.com', 'trace.ns.cloudflare.com'],
+  zone: {
+    code: 'moved',
+    status: 'moved',
+    expectedNs: ['lola.ns.cloudflare.com', 'miguel.ns.cloudflare.com'],
+    publicNs: ['davina.ns.cloudflare.com', 'trace.ns.cloudflare.com'],
+    accountName: "815353729@qq.com's Account",
+  },
+});
+modal = lastModal();
+check('moved 标题点明被另一个账号接管', findByText(modal, '域名已被另一个账号接管').length > 0);
+check('moved 横幅说明不再归本机账号', findByText(modal, '⚠️ 这个域名不再归本机登录的 Cloudflare 账号').length > 0);
+check('moved 列出本账号分配 NS', findByText(modal, 'lola.ns.cloudflare.com / miguel.ns.cloudflare.com').length > 0);
+check('moved 列出公网 NS', findByText(modal, 'davina.ns.cloudflare.com / trace.ns.cloudflare.com').length > 0);
+check('moved 显示本账号名（点破「两个账号」）', findByText(modal, "815353729@qq.com's Account").length > 0);
+check('moved 给出「改回本账号 NS」的执行步骤',
+  findByText(modal, '在域名注册商处把 NS 改回本账号这一对：lola.ns.cloudflare.com / miguel.ns.cloudflare.com（当前公网是 davina.ns.cloudflare.com / trace.ns.cloudflare.com）。隧道与 DNS 记录都在这边，改回即全部恢复。').length > 0);
+check('moved 提醒两边别同时改 (二选一)', findByText(modal, '两种做法都只能二选一，别在两边同时改；改完等几分钟回到面板点「重新检测」。').length > 0);
+check('moved 仍有「重新检测」出口', allButtons(modal).some((b) => b._text === '重新检测'));
+closeUpdateModal();
+
+// pending：NS 还没指过来，话术不能与 moved 混用
+showDnsHelpModal({
+  ok: false,
+  publicNs: ['davina.ns.cloudflare.com'],
+  zone: { code: 'pending', status: 'pending', expectedNs: ['lola.ns.cloudflare.com'], publicNs: [] },
+});
+modal = lastModal();
+check('pending 标题为「域名在本账号未生效」', findByText(modal, '域名在本账号未生效').length > 0);
+check('pending 不冒充 moved', findByText(modal, '域名已被另一个账号接管').length === 0);
 closeUpdateModal();
 
 // CNAME 被改指：文案要换成更危险的那一类
