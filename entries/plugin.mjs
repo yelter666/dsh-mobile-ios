@@ -14,9 +14,10 @@ import { createMockHost } from '../src/adapter/mock-host.mjs';
 import { createMuxHost } from '../src/adapter/mux-host.mjs';
 import { createCordisHost } from '../src/adapter/cordis-host.mjs';
 import { createProvisioner } from '../src/cloudflare.mjs';
+import { PLUGIN_VERSION } from '../src/version.mjs';
 
 export const name = 'dsh-mobile-ios';
-export const version = '0.2.1';
+export const version = PLUGIN_VERSION;
 
 /**
  * 本机 cloudflared 发现链：config.tunnelBin → env CLOUDFLARED_BIN（tunnel.mjs 处理）

@@ -4,6 +4,7 @@
 import { fail, ERRORS, newId } from './protocol.mjs';
 import { translateRecords } from './adapter/session-history.mjs';
 import { createRequire } from 'node:module';
+import { PLUGIN_VERSION } from './version.mjs';
 
 // QR 编码（vendor：qrcode-generator 1.4.4，MIT，零依赖；见 lib/vendor/，
 // .cjs 后缀：包为 type:module，require 需显式 CommonJS）
@@ -97,7 +98,8 @@ const DESKTOP_CORS_PATHS = [
   /^\/mobile\/v1\/tunnel\/provision$/,
 ];
 
-const GATEWAY_VERSION = '0.2.1';
+// 面板「插件版本」与更新检查的「当前版本」都取这里；必须与 npm 包版本同源。
+const GATEWAY_VERSION = PLUGIN_VERSION;
 
 function readJson(req) {
   return new Promise((resolve, reject) => {
