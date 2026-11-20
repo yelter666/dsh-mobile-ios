@@ -7,7 +7,8 @@
 // 3. **进程必须能被收干净**。网关退出时子进程不能变成孤儿，否则下次启动端口冲突。
 
 import { execFileSync, spawn as nodeSpawn } from 'node:child_process';
-import { accessSync, constants, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { accessSync, constants, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fail } from './protocol.mjs';
 
@@ -51,8 +52,26 @@ export function findCloudflared(explicit, env = process.env) {
       /* 落到 PATH 搜索 */
     }
   }
-  const dirs = (env.PATH || '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin').split(path.delimiter);
   const name = process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared';
+
+  // 自举安装落点优先于 PATH：面板「自动安装 cloudflared」把二进制写进组件目录后，
+  // 下次 status()/start() 调 findCloudflared 就能立即发现，无需重启插件/宿主。
+  // 路径约定与 entries/plugin.mjs 的 discoverCloudflared、cloudflared-install.mjs 一致。
+  // home 来源与安装侧相同：USERPROFILE/HOME 优先，便于测试隔离与多用户环境。
+  const home = env.USERPROFILE || env.HOME || os.homedir();
+  const componentRoot = path.join(home, '.dsh', 'mobile-access', 'components', 'cloudflared');
+  try {
+    const versions = readdirSync(componentRoot).filter((v) => !v.startsWith('.')).sort().reverse();
+    for (const v of versions) {
+      const candidate = path.join(componentRoot, v, name);
+      try {
+        accessSync(candidate, constants.X_OK);
+        return candidate;
+      } catch { /* 该版本目录里没有可执行文件，继续 */ }
+    }
+  } catch { /* 组件目录不存在，落到 PATH */ }
+
+  const dirs = (env.PATH || '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin').split(path.delimiter);
   for (const dir of dirs) {
     if (!dir) continue;
     const candidate = path.join(dir, name);

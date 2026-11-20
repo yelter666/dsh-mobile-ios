@@ -5,6 +5,7 @@ import { fail, ERRORS, newId } from './protocol.mjs';
 import { translateRecords } from './adapter/session-history.mjs';
 import { createRequire } from 'node:module';
 import { PLUGIN_VERSION } from './version.mjs';
+import { ensureCloudflared, resolveAsset } from './cloudflared-install.mjs';
 
 // QR 编码（vendor：qrcode-generator 1.4.4，MIT，零依赖；见 lib/vendor/，
 // .cjs 后缀：包为 type:module，require 需显式 CommonJS）
@@ -96,6 +97,7 @@ const DESKTOP_CORS_PATHS = [
   /^\/mobile\/v1\/tunnel\/start$/,
   /^\/mobile\/v1\/tunnel\/stop$/,
   /^\/mobile\/v1\/tunnel\/provision$/,
+  /^\/mobile\/v1\/tunnel\/install-cloudflared$/,
 ];
 
 // 面板「插件版本」与更新检查的「当前版本」都取这里；必须与 npm 包版本同源。
@@ -233,6 +235,8 @@ export function createRestRouter({ core, pairing, host, tickets, config = {}, lo
       // 面板与二维码都要据此避开它，而不是让用户拿一个必然失败的地址去扫。
       dnsOk: prov?.dnsOk ?? null,
       warning: prov?.warning ?? null,
+      // 面板据此决定是否显示「自动安装 cloudflared」入口：仅在缺失且有官方构建时为 true。
+      canAutoInstall: base.executable === 'missing' && !!resolveAsset({}),
     };
   };
 
@@ -487,6 +491,28 @@ export function createRestRouter({ core, pairing, host, tickets, config = {}, lo
     const result = await config.tunnel.stop();
     return send(ctx.res, 200, { ...tunnelSnapshot(), ...result });
 
+  });
+
+  /**
+   * 自举安装 cloudflared（每机首次开启远程）。回环-only：只有主机本机能触发下载执行。
+   * 面板必须先弹窗得到用户同意才调用此端点；服务端不做静默后台安装。
+   * 下载源固定为 Cloudflare 官方 Release，落点私有组件目录，不改系统 PATH。
+   */
+  route('POST', /^\/mobile\/v1\/tunnel\/install-cloudflared$/, async (ctx) => {
+    loopbackOnly(ctx, '安装 cloudflared 只允许在主机本机操作');
+    if (!config.tunnel) throw fail(4021, '隧道能力未启用', { method: 'tunnel.installCloudflared' });
+    let result;
+    try {
+      result = await ensureCloudflared({ destDir: config.cloudflaredDir || undefined });
+    } catch (err) {
+      log(`rest  tunnel install-cloudflared 失败 ${err?.code || ''} ${err?.message || err}`);
+      throw fail(4500, err?.message || '自动安装 cloudflared 失败', {
+        code: err?.code || 'INSTALL_FAILED',
+      });
+    }
+    log(`rest  tunnel install-cloudflared ${result.reused ? '复用' : '已装'} ${result.executable}`);
+    // 立即重取状态：findCloudflared 已把组件目录纳入发现链，装完应马上从 missing 变 found。
+    return send(ctx.res, 200, { ...result, status: tunnelSnapshot() }, DESKTOP_CORS);
   });
 
   // 诊断包（GW-9）：一次拿到可直接粘贴给支持人员的东西。
