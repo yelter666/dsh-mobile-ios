@@ -9,7 +9,7 @@ DSH Mobile iOS 是 DSH Moblie 项目的桌面端插件与 iOS移动伴侣 App �
 ## 安装
 
 在 DSH 桌面端：**插件 → 添加插件**，输入框填包名 `dsh-mobile-ios`，点安装即可。
-输入框接受的就是 **npm 包名**（也可带版本，如 `dsh-mobile-ios@0.2.1`）、Git 仓库
+输入框接受的就是 **npm 包名**（也可带版本，如 `dsh-mobile-ios@0.2.2`）、Git 仓库
 地址或本地插件目录路径。安装源展开后可选：
 
 - **npm 官方源** `registry.npmjs.org`
