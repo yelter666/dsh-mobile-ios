@@ -55,10 +55,12 @@ const copied = [];
 let lastCopyValue = '';
 
 let captured = null;
+let uuidSeq = 0;
 const sandbox = {
   window: windowStub, document: documentStub, navigator: navigatorStub,
   console, setTimeout, clearTimeout, setInterval, clearInterval,
   AbortSignal, fetch: async () => { throw new Error('no network in test'); },
+  crypto: { randomUUID: () => `11111111-2222-3333-4444-${String(++uuidSeq).padStart(12, '0')}` },
   getComputedStyle: () => ({ backgroundColor: 'rgb(20, 20, 20)' }),
   require: (id) => {
     if (id === 'react') return { createElement: () => makeEl() };
@@ -73,7 +75,9 @@ vm.runInContext(src, sandbox);
 check('client.js 通过 __ModuleLoader__ 注册模块', !!captured);
 const exports = captured.factory(sandbox.require);
 const { showUpdateModal, closeUpdateModal, copyToClipboard } = exports.__test;
+const { performUpdate, setPluginManager, setUpdateTimeout, isUpdateInFlight, unwrapRemote } = exports.__test;
 check('测试钩子导出对话框函数', typeof showUpdateModal === 'function' && typeof closeUpdateModal === 'function');
+check('测试钩子导出一步更新函数', typeof performUpdate === 'function' && typeof setPluginManager === 'function' && typeof isUpdateInFlight === 'function');
 
 function findByText(el, text, out = []) {
   if (el._text === text) out.push(el);
@@ -137,6 +141,89 @@ copied.length = 0;
 const copiedOk = await copyToClipboard('dsh-mobile-ios@0.2.4');
 check('复制成功返回 true', copiedOk === true);
 check('复制内容正确', copied.includes('dsh-mobile-ios@0.2.4'));
+
+// ── 一步更新状态机 ──────────────────────────────────────────
+console.log('\n一步更新状态机\n');
+
+// banner 渲染：横幅带文本与 tone 类
+showUpdateModal({
+  title: '新版本更新',
+  banner: { text: '⬆️ 发现新版本 v0.2.5，可一键更新', tone: 'info' },
+  lines: [], note: '', actions: [],
+});
+modal = lastModal();
+check('横幅文本渲染', findByText(modal, '⬆️ 发现新版本 v0.2.5，可一键更新').length > 0);
+check('横幅带 tone 样式类', (() => {
+  let found = false;
+  const walk = (el) => { if ((el.className || '').includes('modal-banner') && el.className.includes('info')) found = true; (el.children || []).forEach(walk); };
+  walk(modal); return found;
+})());
+closeUpdateModal();
+
+// unwrapRemote：信封解包成功/失败
+check('unwrapRemote 解包 ok 信封', unwrapRemote({ ok: true, value: { status: 'applied' } }).status === 'applied');
+check('unwrapRemote 拒绝失败信封', (() => { try { unwrapRemote({ ok: false, error: { code: 'X' } }); return false; } catch (e) { return e.message === 'X'; } })());
+check('unwrapRemote 透传非信封', unwrapRemote({ status: 'applied' }).status === 'applied');
+
+// 成功路径：installBundle 收到正确 spec/requestId，弹窗显示成功，锁释放
+let installArgs = null;
+setPluginManager({
+  installBundle: async (spec, opts) => { installArgs = { spec, opts }; return { ok: true, value: { status: 'applied', restartRequired: true } }; },
+  waitForInstall: async () => null,
+});
+await performUpdate('0.2.5');
+check('installBundle spec 为 包名@版本', installArgs?.spec === 'dsh-mobile-ios@0.2.5');
+check('installBundle 传 enabled:true', installArgs?.opts?.enabled === true);
+check('installBundle 传合法 UUID requestId', /^[0-9a-f-]{36}$/i.test(installArgs?.opts?.requestId || ''));
+modal = lastModal();
+check('成功后显示成功横幅', findByText(modal, '✅ 已安装 v0.2.5').length > 0);
+check('需重启时提示重启', findByText(modal, '插件已更新，重启 DSH 桌面端后生效。') !== undefined);
+check('成功后并发锁已释放', isUpdateInFlight() === false);
+closeUpdateModal();
+
+// 失败路径：installBundle 抛出 → 失败横幅 + 重试入口
+setPluginManager({
+  installBundle: async () => { throw new Error('网络中断'); },
+  waitForInstall: async () => null,
+});
+await performUpdate('0.2.6');
+modal = lastModal();
+check('失败后显示失败横幅', findByText(modal, '❌ 更新未成功').length > 0);
+check('失败后含重试按钮', allButtons(modal).some((b) => b._text === '重试更新'));
+check('失败原因透传到文案', (() => {
+  let found = false;
+  const walk = (el) => { if ((el._text || '').includes('网络中断')) found = true; (el.children || []).forEach(walk); };
+  walk(modal); return found;
+})());
+closeUpdateModal();
+
+// 超时对账路径：installBundle 永不 settle → 极短超时 → waitForInstall 对账成功，判为成功且只提交一次
+setUpdateTimeout(30);
+let waitCalledWith = null;
+let installSubmitCount = 0;
+setPluginManager({
+  installBundle: async () => {
+    installSubmitCount += 1;
+    // 100ms 后 resolve，但超时设为 30ms，确保先走超时→对账分支；避免永不 settle 的悬挂 promise 拖住事件循环。
+    return new Promise((resolve) => setTimeout(() => resolve({ ok: true, value: { status: 'applied' } }), 100));
+  },
+  waitForInstall: async (id) => { waitCalledWith = id; return { ok: true, value: { status: 'applied' } }; },
+});
+await performUpdate('0.2.8');
+modal = lastModal();
+check('超时后调用 waitForInstall 对账', waitCalledWith !== null);
+check('对账 requestId 与提交一致', waitCalledWith === installArgs?.opts?.requestId || /^[0-9a-f-]{36}$/i.test(waitCalledWith || ''));
+check('对账成功判为成功横幅', findByText(modal, '✅ 已安装 v0.2.8').length > 0);
+check('超时对账不重复提交安装', installSubmitCount === 1);
+setUpdateTimeout(180000);
+
+// 降级路径：无 pluginManager → 显示不可用 + 复制入口
+setPluginManager(null);
+await performUpdate('0.2.7');
+modal = lastModal();
+check('无安装服务显示降级横幅', findByText(modal, '⚠️ 宿主未提供一步更新能力').length > 0);
+check('降级保留复制包名入口', allButtons(modal).some((b) => (b._text || '').includes('复制')));
+closeUpdateModal();
 
 console.log(`\n结果：${pass} 通过 / ${failures.length} 失败`);
 if (failures.length) process.exit(1);
