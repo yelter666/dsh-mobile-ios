@@ -893,6 +893,17 @@ export function createRestRouter({ core, pairing, host, tickets, config = {}, lo
     return send(ctx.res, 200, result);
   });
 
+  // 新建工作区（2026-11-22）：手机端「新任务会话」可以选、也可以新建工作区。
+  // 工作区在宿主里就是一个已存在目录的注册，所以这里是「登记一个目录」，
+  // 不是「创建文件夹」——目录不存在时宿主会拒绝，如实回 4400。
+  // 同一目录重复登记幂等（拿回原分组，`created: false`）。
+  route('POST', /^\/mobile\/v1\/workspaces$/, async (ctx) => {
+    auth(ctx.req);
+    const body = await readJson(ctx.req);
+    const result = await core.idempotent(body.submissionId, () => host.createWorkspace(body));
+    return send(ctx.res, 201, result);
+  });
+
   // 工作区写动作（2026-11-21）：与桌面端分组右键菜单同源。
   // 宿主 workspaceController.rename/delete 的进程内直调，202 同步回执；带 submissionId
   // 幂等防手抖重复删。删除只移除分组注册（会话落到未分组、文件保留），不是删文件。

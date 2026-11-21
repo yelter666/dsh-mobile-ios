@@ -327,7 +327,44 @@ bash spike0/run-demo.sh            # 自动起服务 → 造 3 帧 → 跑客户
 
 换账号后 `ensure()` 会自动识别账号变更、重建隧道并**沿用同一个子域**（地址不变、无需重新配对）。
 
-## 10. 下一步
+## 10. 新任务会话：会话归属与「拒绝」语义（0.2.21）
+
+这一节记录 2026-11-22 真机上「新建无反应 / 历史会话一条也发不出去」的两个根因，
+改动前必读——两处都不是 UI 问题，是**错误分类**和**归属**的问题。
+
+### 10.1 附件被拒不能是可重试错误
+
+真机日志里 `session/attachment-invalid` 出现了 247 次：宿主明确拒绝附件
+（`MODEL_DOES_NOT_SUPPORT_IMAGES` / `IMAGES_TOO_LARGE` / `TOO_MANY_IMAGES`），
+但网关的宿主错误映射表里没有这一条 → 兜底成 `4500`（可重试）→ 客户端用同一个
+`submissionId` 无限重放 → 写队列保序、队首永不前进 → **后面所有消息都发不出去**。
+
+现在的分类（`src/adapter/host-errors.mjs`，映射从 cordis-host 抽出来单独可断言）：
+
+| 宿主错误 | 网关码 | 语义 |
+|---|---|---|
+| `session/attachment-invalid` | `4400` | 不可重试；`message` 是能行动的那一句，`reason` 保留宿主 original code |
+| `session/model-unavailable` | `4400` | 同上：模型不存在/不可用，重发也没用 |
+| 其余未知宿主码 | `4500` | 仍按可重试兜底 |
+
+客户端还有第二道刹车：**服务端侧退回**计数到上限（默认 6 次）就把该条判失败、
+让出队首（`WriteQueue.maxServerDeferrals`）。网络层错误不计数，所以真离线排队
+不会被误杀。
+
+### 10.2 会话归属：`workspaceId` 而不是让客户端算路径
+
+工作区在宿主里就是**一个已存在目录的注册**。手机端不该猜目录，只传分组 id：
+
+- `POST /mobile/v1/workspaces { path, title? }` → 201 `{ workspaceId, path, title, created }`；
+  路径必须绝对且已存在（相对路径前置拦成 `4400`，不打宿主）；同一目录重复登记幂等（`created: false`）。
+- `POST /mobile/v1/tasks { workspaceId? }` → 网关 `resolveWorkspaceTarget` 把 `cwd` 设成
+  工作区 `path`，建完会话调 `Workspace.attachSession(sessionId)` 归组；
+  **省略 = 未分组**，`cwd` 交给电脑端默认工作目录。
+
+宿主 `attachSession` 会比对会话 header 的 `cwd` 与 `workspace.path`（`realpath` 规范化后
+必须严格相等），所以网关必须先用工作区路径建会话、再 attach——顺序反了会抛错。
+
+## 11. 下一步
 
 1. **X2 真宿主实跑**：desktop profile 的 `cordis.patch.yml` 打开 `host: mux` 重启，对照 diag 服务可见性。
 2. 真机安装 cloudflared 后（macOS `brew install cloudflared`；Windows 下载 `cloudflared.exe`

@@ -175,7 +175,7 @@ export function createMockHost({ log = () => {}, autoPlay = false, speed = 1, da
       };
     },
 
-    async createTask({ prompt, title, permission, budgetMin = 10, attachments, provider, model } = {}) {
+    async createTask({ prompt, title, permission, budgetMin = 10, attachments, provider, model, workspaceId } = {}) {
       const taskId = newId('tsk');
       // 新建会话指定模型（2026-11-21）：与真宿主同口径，请求了就记进会话并在回执里回显。
       const modelApplied = provider && model ? true : undefined;
@@ -185,6 +185,12 @@ export function createMockHost({ log = () => {}, autoPlay = false, speed = 1, da
       if (preset && !MOCK_PERMISSION_OPTIONS.some((o) => o.value === preset)) {
         throw fail(4400, `未知权限预设：${preset}`);
       }
+      // 工作区（2026-11-22）：与真宿主同口径——会话的 cwd 必须落在该工作区目录下，
+      // 否则它不会被归进这一组（真宿主 attachSession 会按 cwd 严格相等校验）。
+      const wantedWs = String(workspaceId ?? '').trim();
+      const ws = wantedWs ? workspaces.find((w) => String(w.workspaceId ?? w.id) === wantedWs) : null;
+      if (wantedWs && !ws) throw fail(4400, '选中的工作区已不在电脑端 — 刷新任务列表后重新选。', { detail: `workspace=${wantedWs}` });
+      const cwd = ws ? String(ws.path ?? `/mock/${ws.name ?? 'workspace'}`) : '/mock/workspace';
       tasks.set(taskId, {
         taskId,
         storedKey: newId('sk'),
@@ -196,13 +202,21 @@ export function createMockHost({ log = () => {}, autoPlay = false, speed = 1, da
         lastActivityAt: new Date().toISOString(),
         hostId: hostInfo.hostId,
         hostName: hostInfo.hostName,
-        cwd: '/mock/workspace',
+        cwd,
+        workspaceId: ws ? String(ws.workspaceId ?? ws.id) : null,
+        workspaceName: ws ? String(ws.name ?? ws.title ?? '') : null,
         permission: preset ?? 'workspaceWrite',
         budgetMin,
         needsYou: false,
         pendingTodoCount: 0,
         artifactsCount: 0,
       });
+      if (ws) {
+        // 会话归属：真宿主是 workspace.sessionIds（有序数组），mock 就地补进去，
+        // 让列表快照能看出「新建的会话进了选中分组」。
+        if (!Array.isArray(ws.sessionIds)) ws.sessionIds = [];
+        ws.sessionIds.unshift(taskId);
+      }
       emit(taskId, 'state', { status: 'running', phase: { index: 1, total: 5, label: '已接收' }, elapsedSec: 0, needsYou: false });
       log(`host  createTask ${taskId}`);
       return { ...createOk, taskId, storedKey: tasks.get(taskId).storedKey, acceptedAt: new Date().toISOString(),
@@ -304,6 +318,27 @@ export function createMockHost({ log = () => {}, autoPlay = false, speed = 1, da
     }
     log(`host  delete workspace ${id}（会话落到未分组，文件保留）`);
     return { applied: true, workspaceId: id, deleted: true, at: new Date().toISOString() };
+  },
+
+  // 新建工作区（2026-11-22，与真宿主 workspaceController.create 同口径）：
+  // 同一目录重复注册拿回原分组（幂等），不会建出两个同名分组。
+  async createWorkspace({ path, title } = {}) {
+    const dir = String(path ?? '').trim();
+    if (!dir) throw fail(4400, '目录路径不能为空');
+    if (!dir.startsWith('/')) throw fail(4400, '目录路径必须是绝对路径，例如 /Users/你/Documents/项目');
+    const existing = workspaces.find((w) => String(w.path ?? '') === dir);
+    if (existing) {
+      return {
+        applied: true, workspaceId: String(existing.workspaceId ?? existing.id),
+        title: String(existing.name ?? existing.title ?? ''), path: dir,
+        created: false, at: new Date().toISOString(),
+      };
+    }
+    const id = newId('ws');
+    const name = String(title ?? '').trim() || dir.split('/').filter(Boolean).pop() || dir;
+    workspaces.push({ id, name, path: dir, sessionIds: [] });
+    log(`host  create workspace ${id} path=${dir}`);
+    return { applied: true, workspaceId: id, title: name, path: dir, created: true, at: new Date().toISOString() };
   },
 
   async pinTask(taskId, { pinned = true } = {}) {

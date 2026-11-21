@@ -16,24 +16,13 @@
 
 import crypto from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
+import { isAbsolute } from 'node:path';
 import { fail, GatewayError } from '../protocol.mjs';
 import { displayHostName } from '../host-name.mjs';
 import { translateLiveEvent } from './session-history.mjs';
 import { deriveArtifacts, decodeArtifactId, mimeOf } from './artifacts.mjs';
 
-// 宿主 RemoteError.code → 我们的协议错误码。
-// 宿主码来自 dsh-typert-protocol / 各控制器源码（gateway/bad-request、
-// session/not-found、session/agent-busy、workspace/not-found 等）。
-const HOST_CODE_MAP = {
-  'session/not-found': 4011,
-  'workspace/not-found': 4011,
-  'session/agent-busy': 4007,
-  'session/wait-timeout': 4007,
-  'gateway/bad-request': 4400,
-  'gateway/internal': 4500,
-  'gateway/signature-invalid': 4400,
-  'gateway/context-unavailable': 4021,
-};
+import { toGatewayError, isHostRemoteError } from './host-errors.mjs';
 
 /** 宿主服务名清单（诊断与 services 证据用；来源：各控制器 `static inject` 与 super(ctx, 名)）。 */
 const WATCHED_SERVICES = [
@@ -69,21 +58,6 @@ const SERVED_CAPS = [
   // 2026-11-18：提示词增强（真调宿主 llm，一次性补全）。客户端据此点亮增强按钮。
   'prompt.enhance',
 ];
-
-function isHostRemoteError(err) {
-  return err && typeof err === 'object' && err.isDSHRemoteError === true;
-}
-
-function toGatewayError(err, method) {
-  if (isHostRemoteError(err)) {
-    const code = HOST_CODE_MAP[err.code] ?? 4500;
-    return fail(code, code === 4500 ? `宿主错误：${err.code}` : undefined, {
-      detail: `host=${err.code} method=${method}`,
-      hostCode: err.code,
-    });
-  }
-  return fail(4500, `宿主调用异常`, { detail: `method=${method} ${err?.message || String(err)}` });
-}
 
 /** 从 cwd 取展示标题（宿主 summary 不带标题；标题投影在 projections 里，命中即用）。 */
 function deriveTitle(summary) {
@@ -439,8 +413,78 @@ export function createCordisHost({ ctx, log = () => {}, hostname = displayHostNa
    */
   const INLINE_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 
+  /** 附件摘要（种类:名字:字节数），只用于日志排查。 */
+  function describeAttachments(attachments) {
+    if (!Array.isArray(attachments) || attachments.length === 0) return 'none';
+    return attachments.map((att) => {
+      const kind = att?.kind === 'image' ? 'image' : 'file';
+      const name = typeof att?.name === 'string' ? att.name : 'attachment';
+      const b64 = typeof att?.dataBase64 === 'string' ? att.dataBase64 : '';
+      const bytes = b64 ? Math.round((b64.length * 3) / 4) : 0;
+      return `${kind}:${name}:${bytes}B${att?.mediaType ? `(${att.mediaType})` : ''}`;
+    }).join(' | ');
+  }
+
+  /**
+   * 把「选中的工作区」翻成新建会话要用的 cwd。
+   *
+   * 宿主里工作区就是一个目录注册（`workspaceRegistry.list()` 元素带 `path`），
+   * 而 `Workspace.attachSession` 会用会话 header 的 cwd 与 `workspace.path` 做
+   * **严格相等**校验（app.asar 实证）。所以：先按 id 取目录，再带着这个 cwd 建会话，
+   * 最后把会话归入工作区——三步少一步，会话就会掉进「未分组」。
+   */
+  function resolveWorkspaceTarget(workspaceId, cwd) {
+    const id = String(workspaceId ?? '').trim();
+    if (!id) return { cwd: cwd ? String(cwd).trim() : '', workspace: null, entity: null };
+    let entity = null;
+    try {
+      const reg = service('workspaceRegistry', 'workspace/attach');
+      entity = typeof reg.get === 'function' ? reg.get(id) : null;
+    } catch {
+      entity = null;
+    }
+    const snapshot = workspaceIndex().byId.get(id);
+    const path = String(entity?.path ?? snapshot?.path ?? '').trim();
+    if (!path) {
+      throw fail(4400, '选中的工作区已不在电脑端 — 刷新任务列表后重新选。', {
+        detail: `workspace=${id}`, reason: 'workspace-unavailable',
+      });
+    }
+    return {
+      cwd: path,
+      workspace: { id, title: String(entity?.title ?? snapshot?.title ?? ''), path },
+      entity,
+    };
+  }
+
+  /**
+   * 把新会话归入工作区。失败**不影响**已经建好的会话：它仍然可用，
+   * 只是从「某工作区」掉到「未分组」，日志里留下原因。
+   */
+  async function attachToWorkspace(sessionId, workspace, entity) {
+    if (!workspace) return;
+    try {
+      let ws = entity;
+      if (!ws) {
+        const reg = service('workspaceRegistry', 'workspace/attach');
+        ws = typeof reg.get === 'function' ? reg.get(workspace.id) : null;
+      }
+      if (ws && typeof ws.attachSession === 'function') {
+        await ws.attachSession(sessionId);
+        log(`cordis 会话 ${sessionId} 归入工作区「${workspace.title || workspace.id}」`);
+      } else {
+        log(`cordis 会话 ${sessionId} 归入工作区失败：宿主没有可用的 attachSession`);
+      }
+    } catch (err) {
+      log(`cordis 会话 ${sessionId} 归入工作区失败：${err?.message ?? String(err)}`);
+    }
+  }
+
   async function attachmentBlocks(sessionId, attachments) {
     if (!Array.isArray(attachments) || attachments.length === 0) return [];
+    // 附件摘要进日志：真机排查「附件无效」时，唯一能看到的就是这几个字段
+    // （绝不打印字节或正文）。
+    log(`attachments ${sessionId} ${describeAttachments(attachments)}`);
     const blocks = [];
     for (const att of attachments) {
       const name = typeof att?.name === 'string' && att.name ? att.name : 'attachment';
@@ -761,12 +805,13 @@ export function createCordisHost({ ctx, log = () => {}, hostname = displayHostNa
    * 拿不到就回空索引——移动端退化为「未分组」，绝不猜 cwd 冒充工作区名。
    */
   function workspaceIndex() {
-    const empty = { bySession: new Map(), groups: [] };
+    const empty = { bySession: new Map(), byId: new Map(), groups: [] };
     try {
       const reg = service('workspaceRegistry', 'workspace/list');
       const list = typeof reg.list === 'function' ? reg.list() : [];
       if (!Array.isArray(list)) return empty;
       const bySession = new Map();
+      const byId = new Map();
       const groups = [];
       for (const ws of list) {
         if (!ws) continue;
@@ -775,7 +820,12 @@ export function createCordisHost({ ctx, log = () => {}, hostname = displayHostNa
         // 真实宿主是 title；旧快照里出现过 name（mock fixture 同形），两者都认。
         const title = String(ws.title || ws.name || '').trim();
         if (!title) continue;
-        groups.push({ id, name: title });
+        // path 只给网关自己用（新建会话时当 cwd 用）；客户端拿到也只当提示，
+        // 但不下发到任务行——手机上没有「打开这个目录」的动作，摆出来是噪声。
+        const path = typeof ws.path === 'string' ? ws.path : '';
+        groups.push({ id, name: title, ...(path ? { path } : {}) });
+        // 按 id 取工作区实体（attachSession 要实体，不是快照）。
+        if (path) byId.set(id, { id, title, path });
         // sessionIds 在宿主里是 Set，别用 Array.isArray 判——那会把归属全丢掉。
         const ids = ws.sessionIds instanceof Set
           ? [...ws.sessionIds]
@@ -785,7 +835,7 @@ export function createCordisHost({ ctx, log = () => {}, hostname = displayHostNa
           bySession.set(String(sid), { id, title });
         }
       }
-      return { bySession, groups };
+      return { bySession, byId, groups };
     } catch {
       return empty;
     }
@@ -936,16 +986,22 @@ export function createCordisHost({ ctx, log = () => {}, hostname = displayHostNa
       });
     },
 
-    async createTask({ prompt, cwd, attachments, permission, provider, model, reasoningEffort } = {}) {
+    async createTask({
+      prompt, cwd, workspaceId, attachments, permission, provider, model, reasoningEffort,
+    } = {}) {
       return call('session/create+prompt', async () => {
         if ((!prompt || !String(prompt).trim()) && !(Array.isArray(attachments) && attachments.length)) {
           throw fail(4400, 'prompt 不能为空');
         }
+        // 工作区（2026-11-22）：手机上新任务可以选「放进哪个工作区」。
+        // 工作区在宿主里就是一个目录，所以 cwd 必须与它一致，建完再把会话归进去。
+        const target = resolveWorkspaceTarget(workspaceId, cwd);
         const ctrl = service('sessionController', 'session/create');
-        const created = await ctrl.create(cwd ? { cwd } : {});
+        const created = await ctrl.create(target.cwd ? { cwd: target.cwd } : {});
         // create 也走 {ok, value} 信封（考古 client.js：result.value.sessionId）
         const sessionId = created?.ok === true ? created?.value?.sessionId : created?.sessionId;
         if (!sessionId) throw fail(4500, '宿主 create 未返回 sessionId');
+        await attachToWorkspace(sessionId, target.workspace, target.entity);
         // 新会话还没有任何事件：基线就是 0，从第一条开始都在观察范围内。
         const baseline = await preWriteSeq(sessionId);
         // 新建会话默认权限（2026-11-20）：必须排在**提交首条提示之前**。
@@ -957,8 +1013,21 @@ export function createCordisHost({ ctx, log = () => {}, hostname = displayHostNa
         // 否则第一句话仍走电脑端默认模型，用户在新建页选的模型等于没选。
         // 复用宿主 session/selectModel（与详情页模型胶囊同一动作），不另造协议。
         const modelApplied = await applyInitialModel(sessionId, { provider, model, reasoningEffort });
-        const blocks = await attachmentBlocks(sessionId, attachments);
-        await submitPrompt(ctrl, sessionId, prompt ? String(prompt) : '', blocks);
+        // 首条提示被拒时，会话已经建出来了（宿主 create 成功）但一句话都没有。
+        // 这里必须先把证据写进日志再外抛：会话 id + 宿主 reason + 附件摘要，
+        // 否则线上只剩一句「4500」，只能靠猜。错误本身的分类见 HOST_CODE_MAP
+        // （attachment-invalid → 4400，不可重试）。
+        let blocks;
+        try {
+          blocks = await attachmentBlocks(sessionId, attachments);
+          await submitPrompt(ctrl, sessionId, prompt ? String(prompt) : '', blocks);
+        } catch (err) {
+          log(`cordis create+prompt 首条被拒 session=${sessionId} `
+            + `error=${err?.code ?? err?.message ?? 'unknown'} `
+            + `reason=${err?.details?.reason ?? '-'} `
+            + `attachments=${describeAttachments(attachments)}`);
+          throw err;
+        }
         // 新会话立刻进入观察集：宿主 running 标志可能晚一拍，等它就漏掉首条回复。
         markWatched(sessionId, baseline);
         log(`cordis create+prompt session=${sessionId}`);
@@ -1136,6 +1205,58 @@ export function createCordisHost({ ctx, log = () => {}, hostname = displayHostNa
         unwrapHost(raw);
         log(`cordis delete workspace=${id}（会话落到未分组，文件保留）`);
         return { applied: true, workspaceId: id, deleted: true, at: new Date().toISOString() };
+      });
+    },
+
+    /**
+     * 新建工作区（2026-11-22）：把电脑上一个**已存在**的目录注册成分组。
+     *
+     * 宿主 `workspaceController.create({ path })` 是「Create or idempotently
+     * resolve one Workspace over an existing directory」——路径必须绝对、存在、
+     * 且是目录，重复注册同一个目录会拿回原实体（不会建出两个同名分组）。
+     * 标题默认取目录末段；手机端可以另起一个（走 registry.setTitle，
+     * 与桌面端重命名同一条写路径）。
+     */
+    async createWorkspace({ path, title } = {}) {
+      return call('workspace/create', async () => {
+        const dir = String(path ?? '').trim();
+        if (!dir) throw fail(4400, '目录路径不能为空');
+        // 宿主 create 只接受**绝对路径**，且目录必须已存在；相对路径在宿主那里
+        // 会抛一个普通 Error → 落到 4500（可重试），客户端就会白刷 15 秒。
+        // 在这里先拦成 4400，把「路径写错了」这件事一次讲清楚。
+        if (!isAbsolute(dir)) {
+          throw fail(4400, '目录路径要用电脑上的完整路径，例如 /Users/你/Documents/项目', {
+            detail: `path=${dir}`, reason: 'workspace-path-not-absolute',
+          });
+        }
+        const ctrl = service('workspaceController', 'workspace/create');
+        const raw = await ctrl.create({ path: dir });
+        const value = unwrapHost(raw);
+        const workspace = value?.workspace ?? value;
+        const id = String(workspace?.workspaceId ?? workspace?.id ?? '').trim();
+        if (!id) throw fail(4500, '宿主 create 工作区未返回 workspaceId');
+        let name = String(workspace?.title ?? '').trim();
+        const wanted = String(title ?? '').trim();
+        if (wanted && wanted !== name) {
+          // RPC 的 create 只收 path；标题走 registry（与桌面重命名同一条写路径）。
+          // 改标题失败不该让「工作区已建好」变成报错——它已经是成立的实体。
+          try {
+            const reg = service('workspaceRegistry', 'workspace/title');
+            const entity = typeof reg.get === 'function' ? reg.get(id) : null;
+            if (entity && typeof entity.setTitle === 'function') {
+              await entity.setTitle(wanted);
+              name = wanted;
+            }
+          } catch (err) {
+            log(`cordis 新工作区改标题失败：${err?.message ?? String(err)}`);
+          }
+        }
+        const finalPath = String(workspace?.path ?? dir);
+        log(`cordis create workspace=${id} path=${finalPath} created=${value?.created === true}`);
+        return {
+          applied: true, workspaceId: id, title: name || finalPath.split('/').pop() || finalPath,
+          path: finalPath, created: value?.created === true, at: new Date().toISOString(),
+        };
       });
     },
 
