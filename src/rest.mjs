@@ -728,6 +728,15 @@ export function createRestRouter({ core, pairing, host, tickets, config = {}, lo
     return send(ctx.res, 200, result);
   });
 
+  // App 级设置目录（2026-11-20）：进程级权限目录 + 模型目录。
+  // 与下面那条会话级接口的区别只有一个：这里没有 currentValue（权限当前值是会话事实）。
+  // 存在的理由：设置面板要在「一条会话都还没有」时也能选新建会话默认权限。
+  route('GET', /^\/mobile\/v1\/settings$/, async (ctx) => {
+    auth(ctx.req);
+    const body = await host.appSettings();
+    return send(ctx.res, 200, body);
+  });
+
   // 会话设置同步（2026-11-17）：工作区权限与模型选择，与桌面端同源。
   // 读 = 权限目录 + 当前值 + 模型目录一次拿全；写 = 两条直改端点。
   // 宿主侧哪个面缺失由适配器降级 supported:false，网关不吞、也不替它编数据。
@@ -785,6 +794,26 @@ export function createRestRouter({ core, pairing, host, tickets, config = {}, lo
     auth(ctx.req);
     const body = await readJson(ctx.req).catch(() => ({}));
     const result = await core.idempotent(body.submissionId, () => host.forkTask(ctx.params[0], body));
+    return send(ctx.res, 200, result);
+  });
+
+  // 工作区写动作（2026-11-21）：与桌面端分组右键菜单同源。
+  // 宿主 workspaceController.rename/delete 的进程内直调，202 同步回执；带 submissionId
+  // 幂等防手抖重复删。删除只移除分组注册（会话落到未分组、文件保留），不是删文件。
+  route('POST', /^\/mobile\/v1\/workspaces\/([^/]+)\/rename$/, async (ctx) => {
+    auth(ctx.req);
+    const body = await readJson(ctx.req);
+    if (!body.title || !String(body.title).trim()) throw fail(4400, 'title 不能为空');
+    const result = await core.idempotent(body.submissionId, () =>
+      host.renameWorkspace(ctx.params[0], body));
+    return send(ctx.res, 200, result);
+  });
+
+  route('DELETE', /^\/mobile\/v1\/workspaces\/([^/]+)$/, async (ctx) => {
+    auth(ctx.req);
+    const body = await readJson(ctx.req).catch(() => ({}));
+    const result = await core.idempotent(body.submissionId, () =>
+      host.deleteWorkspace(ctx.params[0], body));
     return send(ctx.res, 200, result);
   });
 

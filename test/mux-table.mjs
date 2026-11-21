@@ -12,6 +12,7 @@
 // 跑法：cd gateway && node test/mux-table.mjs
 
 import { createCordisHost } from '../src/adapter/cordis-host.mjs';
+import { displayHostName, stripLocalSuffix } from '../src/host-name.mjs';
 
 let pass = 0;
 const failures = [];
@@ -28,13 +29,13 @@ function check(name, cond, detail = '') {
 const CODE = (c) => ({ isDSHRemoteError: true, code: c });
 
 /** 假宿主服务组：形状照抄控制器源码（注释里标了出处）。 */
-function fakeServices({ agentBusyOnSteer = false, missing = [] } = {}) {
-  const calls = { create: [], prompt: [], cancel: [] };
+function fakeServices({ agentBusyOnSteer = false, missing = [], rejectPermission = false } = {}) {
+  const calls = { create: [], prompt: [], cancel: [], order: [] };
   const summaries = [
     {
       // live 运行中（summaryFor 形状）
       sessionId: 'sess_live_run', updatedAt: 1700000001000, agentAvailable: true,
-      running: true, blank: false, cwd: '/Users/yezheng/code/dsh-harness',
+      running: true, blank: false, cwd: '/Users/example/code/dsh-harness',
       projections: { values: { title: '跑压测脚本' } },
     },
     {
@@ -48,6 +49,12 @@ function fakeServices({ agentBusyOnSteer = false, missing = [] } = {}) {
       sessionId: 'sess_cold', updatedAt: 1699999000000, agentAvailable: false,
       running: false, blank: false, cwd: '/tmp/old', projections: undefined,
     },
+    {
+      // 只在磁盘上、当前不在宿主内存里的会话（sessions.get 取不到）：
+      // 权限切换够不到活体，必须如实 4007，而不是假装成功。
+      sessionId: 'sess_cold_offline', updatedAt: 1699998000000, agentAvailable: false,
+      running: false, blank: false, cwd: '/tmp/frozen', projections: undefined,
+    },
   ];
   const ctrl = {
     async list() {
@@ -56,11 +63,13 @@ function fakeServices({ agentBusyOnSteer = false, missing = [] } = {}) {
     },
     async create(request) {
       calls.create.push(request);
+      calls.order.push('create');
       if (request.workspaceId !== undefined && request.cwd !== undefined) throw CODE('gateway/bad-request');
       return { sessionId: 'sess_new' };
     },
     async prompt(request) {
       calls.prompt.push(request);
+      calls.order.push('prompt');
       if (agentBusyOnSteer && request.mode === 'steer') throw CODE('session/agent-busy');
       if (request.sessionId === 'sess_missing') throw CODE('session/not-found');
       return { accepted: true };
@@ -109,11 +118,41 @@ function fakeServices({ agentBusyOnSteer = false, missing = [] } = {}) {
         ],
       };
     },
+    // 2026-11-21 修：无活体 Agent 时的真写路径（会话还没起回合）。
+    set(session, name) {
+      calls.permissionSet = calls.permissionSet ?? [];
+      calls.permissionSet.push({ sessionId: session?.id, preset: name });
+      calls.order.push('permissionSet');
+      if (rejectPermission) throw new Error('没有这个预设');
+    },
+  };
+  /** 活体会话集合：真宿主只有跑过回合的会话才有 Agent（agents.get 才有值）。 */
+  const LIVE_AGENT_SESSIONS = new Set(['sess_live_run', 'sess_live_idle']);
+  const KNOWN_SESSIONS = new Set(['sess_live_run', 'sess_live_idle', 'sess_cold', 'sess_new', 'sess_missing']);
+  const agents = {
+    // 真宿主契约：agents.get(SessionId) → Agent | undefined
+    get: (id) => (LIVE_AGENT_SESSIONS.has(id) ? { sessionId: id, kind: 'agent' } : undefined),
+  };
+  const sessions = {
+    // 真宿主契约：sessions.get(SessionId) → Session | undefined（内存里的会话）
+    get: (id) => (KNOWN_SESSIONS.has(id) ? { id } : undefined),
   };
   const commands = {
-    async execute(sessionId, command) {
+    // 真宿主契约：execute(agent: Agent, line, submittedAttachments, signal)
+    // —— 第一个形参是 Agent **对象**，传 sessionId 字符串会抛（线上 4500 的根因）。
+    async execute(agent, line, attachments, signal) {
       calls.commands = calls.commands ?? [];
-      calls.commands.push({ sessionId, command });
+      calls.commands.push({
+        agent,
+        sessionId: agent?.sessionId ?? agent,
+        command: line,
+        attachments,
+        withSignal: signal instanceof AbortSignal,
+      });
+      calls.order.push('commands');
+      if (rejectPermission) {
+        return { ok: true, value: { commandId: 'cmd_x', result: { kind: 'error', text: '没有这个预设' } } };
+      }
       return { ok: true, value: { commandId: 'cmd_1', result: { kind: 'success' } } };
     },
   };
@@ -125,7 +164,8 @@ function fakeServices({ agentBusyOnSteer = false, missing = [] } = {}) {
       if (name === 'sessionController') return ctrl;
       if (name === 'permissionPresets') return permissionPresets;
       if (name === 'commands') return commands;
-      if (name === 'agents') return { get: () => undefined };
+      if (name === 'agents') return agents;
+      if (name === 'sessions') return sessions;
       if (name === 'llm') return { listProviders: () => [] };
       return undefined;
     },
@@ -150,7 +190,7 @@ console.log('\n▶ 方法表：session/list → tasks.list');
   check('live 空闲 → idle（可续，不冒充中断）', res.items.find((t) => t.taskId === 'sess_live_idle')?.status === 'idle');
   check('title 命中投影', res.items.find((t) => t.taskId === 'sess_live_run')?.title === '跑压测脚本');
   check('title 兜底 cwd 基名', res.items.find((t) => t.taskId === 'sess_live_idle')?.title === 'scratch');
-  check('cwd 透传', res.items.find((t) => t.taskId === 'sess_live_run')?.cwd === '/Users/yezheng/code/dsh-harness');
+  check('cwd 透传', res.items.find((t) => t.taskId === 'sess_live_run')?.cwd === '/Users/example/code/dsh-harness');
   check('hostName 进 summary', res.items.every((t) => t.hostName === 'TestHost'));
   check('needsYou 如实为 false（不编造审批态）',
     res.items.every((t) => t.needsYou === false && t.pendingTodoCount === 0));
@@ -287,10 +327,31 @@ console.log('\n▶ 会话设置：sessionSettings / setPermission / selectModel'
   check('settings 模型目录分组透传',
     settings.model.groups[0]?.models?.[0]?.id === 'deepseek-chat', JSON.stringify(settings.model.groups));
 
+  // 2026-11-21 二次修正：宿主真写路径是 permissionPresets.set(session, presetName)
+  // （app.asar 铁证：auto-review 卸载时就是 permissionPresets.set(session, ...)，
+  //  /permission 是 UI 命令注册表、远程调用实测 4500；commands.execute 首参是 sessionId 字符串）。
   const applied = await host.setPermission('sess_live_run', { preset: 'auto' });
   check('权限切换回 applied:true', applied.applied === true && applied.value === 'auto');
-  check('权限切换走 /permission 会话命令（桌面端同路径）',
-    svc.calls.commands?.[0]?.command === '/permission auto', JSON.stringify(svc.calls.commands));
+  check('权限走 permissionPresets.set(session, preset)，不是 /permission 命令',
+    svc.calls.permissionSet?.[0]?.sessionId === 'sess_live_run'
+      && svc.calls.permissionSet[0].preset === 'auto'
+      && !(svc.calls.commands ?? []).some((c) => String(c.command).startsWith('/permission')),
+    JSON.stringify(svc.calls.permissionSet));
+  check('权限回执 via=preset', applied.via === 'preset', JSON.stringify(applied));
+
+  // 冷会话（没跑过回合、没有 Agent）同样走 set——不依赖是否有活体 Agent。
+  const cold = await host.setPermission('sess_cold', { preset: 'auto' });
+  check('冷会话也走 permissionPresets.set(session, name) 直写',
+    svc.calls.permissionSet?.some((c) => c.sessionId === 'sess_cold' && c.preset === 'auto'),
+    JSON.stringify(svc.calls.permissionSet));
+  check('直写回执 via=preset 且 applied:true', cold.via === 'preset' && cold.applied === true,
+    JSON.stringify(cold));
+
+  // 既没有 Agent 也没有内存会话 → 4007（可重试的「主机忙/不在内存里」），不假装成功。
+  let missingSession;
+  try { await host.setPermission('sess_cold_offline', { preset: 'auto' }); } catch (e) { missingSession = e; }
+  check('会话不在宿主里 → 4007（不假装切换成功）', missingSession?.code === 4007,
+    JSON.stringify(missingSession));
 
   const picked = await host.selectModel('sess_live_run', { provider: 'deepseek', model: 'deepseek-chat' });
   check('模型切换回显 selection',
@@ -312,6 +373,68 @@ console.log('\n▶ 会话设置：sessionSettings / setPermission / selectModel'
     degraded.permission.supported === false && degraded.permission.options.length === 0,
     JSON.stringify(degraded.permission));
   check('模型节不受影响', degraded.model.supported === true, JSON.stringify(degraded.model));
+}
+
+// ---- 7b. App 级设置目录 + 新建会话默认权限（2026-11-20） ----
+console.log('\n▶ App 设置：appSettings / createTask 套用默认权限');
+{
+  const svc = fakeServices();
+  const host = createCordisHost({ ctx: svc, hostname: 'TestHost' });
+
+  const appSettings = await host.appSettings();
+  check('appSettings 权限目录来自 permissionPresets（无会话也能取）',
+    appSettings.permission.supported === true && appSettings.permission.options.length === 2,
+    JSON.stringify(appSettings.permission));
+  // 目录里不能冒充「当前值」：currentValue 是会话级事实，App 级没有。
+  check('appSettings 不带虚假 currentValue', appSettings.permission.currentValue === undefined,
+    JSON.stringify(appSettings.permission));
+  check('appSettings 模型目录含默认模型',
+    appSettings.model.default?.model === 'deepseek-chat' && appSettings.model.groups.length === 1,
+    JSON.stringify(appSettings.model));
+
+  // 刚建好的会话还没有 Agent（没起过回合）：直写 permissionPresets.set 落预设。
+  // 顺序不变量：权限必须排在首条 prompt 之前。反了就等于「首回合仍按电脑端默认策略跑」
+  // ——用户以为选了只读，模型已经动过手。
+  const created = await host.createTask({ prompt: '只读跑一遍', permission: 'auto' });
+  check('新建会话带权限 → 回执 permissionApplied:true',
+    created.permissionApplied === true, JSON.stringify(created));
+  const perm = svc.calls.permissionSet?.find((c) => c.sessionId === created.taskId);
+  check('权限落在这条新会话上', perm?.preset === 'auto', JSON.stringify(svc.calls.permissionSet));
+  check('权限在首条 prompt 之前套用（顺序不变量）',
+    svc.calls.order.join('>') === 'create>permissionSet>prompt', JSON.stringify(svc.calls.order));
+
+  // 没要求权限时不带这个字段：客户端据此区分「没要求」与「要求了被拒」。
+  const plain = createCordisHost({ ctx: fakeServices(), hostname: 'TestHost' });
+  const bare = await plain.createTask({ prompt: '不带权限' });
+  check('未请求权限 → 回执无 permissionApplied', bare.permissionApplied === undefined,
+    JSON.stringify(bare));
+
+  // 宿主拒绝预设：会话已经建好，权限失败只如实回执，不半路炸掉创建。
+  const rejected = createCordisHost({ ctx: fakeServices({ rejectPermission: true }), hostname: 'TestHost' });
+  const refused = await rejected.createTask({ prompt: '权限会被拒', permission: 'auto' });
+  check('预设被宿主拒绝 → permissionApplied:false 且会话仍创建',
+    refused.permissionApplied === false && refused.accepted === true, JSON.stringify(refused));
+
+  // 服务缺失 → 权限节如实 supported:false，不编目录。
+  const partial = createCordisHost({ ctx: fakeServices({ missing: ['permissionPresets'] }), hostname: 'TestHost' });
+  const degraded = await partial.appSettings();
+  check('permissionPresets 缺失 → appSettings 权限节 supported:false',
+    degraded.permission.supported === false && degraded.permission.options.length === 0,
+    JSON.stringify(degraded.permission));
+  check('模型节不受影响', degraded.model.supported === true, JSON.stringify(degraded.model));
+}
+
+// ---- 7c. 电脑名：全称 + 去掉 Bonjour 的 .local（2026-11-21） ----
+console.log('\n▶ 电脑名：ComputerName 全称 / 截断 .local');
+{
+  check('stripLocalSuffix 去掉 .local', stripLocalSuffix('MacBook-Air-15-M4.local') === 'MacBook-Air-15-M4',
+    stripLocalSuffix('MacBook-Air-15-M4.local'));
+  check('stripLocalSuffix 容忍结尾点', stripLocalSuffix('MacBook-Air-15-M4.local.') === 'MacBook-Air-15-M4');
+  check('stripLocalSuffix 不动普通名字（含点）', stripLocalSuffix('My.Mac') === 'My.Mac');
+  // 本机的真实取值不作为断言（每台机器不同），只要求：非空、不以 .local 结尾。
+  const name = displayHostName();
+  check('displayHostName 返回非空且无 .local 后缀',
+    typeof name === 'string' && name.trim().length > 0 && !/\.local\.?$/i.test(name), name);
 }
 
 // ---- 8. 宿主内部错误 → 4500 ----

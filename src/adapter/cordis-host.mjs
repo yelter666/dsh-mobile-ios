@@ -14,10 +14,10 @@
 // 纪律（ADR-12 不变）：这一层是唯一允许出现宿主服务的地方；
 // 映射不到的方法显式抛 4021，绝不假装成功。
 
-import os from 'node:os';
 import crypto from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
 import { fail, GatewayError } from '../protocol.mjs';
+import { displayHostName } from '../host-name.mjs';
 import { translateLiveEvent } from './session-history.mjs';
 import { deriveArtifacts, decodeArtifactId, mimeOf } from './artifacts.mjs';
 
@@ -221,7 +221,7 @@ function unwrapEnhancedText(raw) {
   return text;
 }
 
-export function createCordisHost({ ctx, log = () => {}, hostname = os.hostname() } = {}) {
+export function createCordisHost({ ctx, log = () => {}, hostname = displayHostName() } = {}) {
   if (!ctx || (typeof ctx.get !== 'function' && typeof ctx !== 'object')) {
     throw new Error('createCordisHost 需要 cordis 上下文（ctx）');
   }
@@ -611,6 +611,99 @@ export function createCordisHost({ ctx, log = () => {}, hostname = os.hostname()
     return unwrapHost(raw);
   }
 
+  /**
+   * 把权限预设套到某条会话上（新建会话默认权限，2026-11-21 修）。
+   *
+   * 失败**不抛出**：会话已经建好了，为了权限去中断创建只会留下一条没有提示的
+   * 空会话，比权限没套上更难收场。返回 true/false 让回执如实说明，
+   * 手机端据此提示「权限未套用」，不假装成功。
+   */
+  async function applyPermissionPreset(sessionId, preset) {
+    const body = String(preset ?? '').trim();
+    if (!body) return undefined;
+    try {
+      const switched = await switchPermission(sessionId, body);
+      if (switched.kind === 'error') {
+        log(`cordis 新建会话权限被拒：${sessionId} ${body} — ${switched.text}`);
+        return false;
+      }
+      log(`cordis 新建会话权限 ${sessionId} → ${body}（${switched.via}）`);
+      return true;
+    } catch (err) {
+      log(`cordis 新建会话权限失败：${sessionId} ${body} — ${err?.code ?? err?.message ?? 'unknown'}`);
+      return false;
+    }
+  }
+
+  /**
+   * 新建会话时应用用户在新建页选的模型（2026-11-21）。
+   *
+   * 走宿主 `session/selectModel({sessionId, provider, model, reasoningEffort?})`，
+   * 与详情页模型胶囊同一动作，不另造协议。必须在 submitPrompt 之前调用——
+   * 否则首条提示已经用电脑端默认模型跑完了，用户选的模型形同虚设。
+   * provider / model 缺一不可（与 selectModel 的校验一致）；没选就返回 undefined，
+   * 由 JSON.stringify 丢掉，客户端据此区分「没要求」。
+   * 失败如实记日志并返回 false，不阻断建会话（模型没切成不该让会话建不起来）。
+   */
+  async function applyInitialModel(sessionId, { provider, model, reasoningEffort } = {}) {
+    const providerId = String(provider ?? '').trim();
+    const modelId = String(model ?? '').trim();
+    if (!providerId || !modelId) return undefined;
+    try {
+      const ctrl = service('sessionController', 'session/selectModel');
+      const request = { sessionId, provider: providerId, model: modelId };
+      if (reasoningEffort) request.reasoningEffort = String(reasoningEffort);
+      await ctrl.selectModel(request, rpcSignal());
+      log(`cordis 新建会话模型 ${sessionId} → ${providerId}/${modelId}`);
+      return true;
+    } catch (err) {
+      log(`cordis 新建会话模型失败：${sessionId} ${providerId}/${modelId} — ${err?.code ?? err?.message ?? 'unknown'}`);
+      return false;
+    }
+  }
+
+  /**
+   * 切换会话权限预设（2026-11-21 二次修正：以宿主真写路径 permissionPresets.set 为主）。
+   *
+   * app.asar 铁证（本轮逐条核对，推翻上一轮的 Agent 对象推断）：
+   *   · 桌面端自己的 `SessionController.command(line)` =
+   *       `ctx.remote.commands.execute(this.sessionId, line, [])` —— 第一个参数是
+   *       **sessionId 字符串**，不是 Agent；上一轮改成传 Agent 是误判。
+   *   · `commands/execute` 的 zod schema：parameter_0 = z.string()（sessionId）。
+   *   · 权限**真写**在 `@deepseek-ai/dsh-permission-presets`：
+   *       `permissionPresets.set(session, presetName)`（session 来自 sessions.list()，
+   *       "written through to their own session events"）—— 桌面端 auto-review
+   *       卸载时就是 `permissionPresets.set(session, "danger-full-access")`。
+   *
+   * 因此直接用宿主的真写 setter，session 从宿主内存里按 id 取：
+   *   `sessions.get(taskId)` 或退回 `sessions.list().find(...)`（两种宿主版本都兼容）。
+   * 不再经过 `/permission` 命令注册表（那是给 UI 用的 human command registry，
+   * 远程调用实测 4500，具体宿主异常已随 detail 记进日志）。
+   * 会话不在宿主内存 → 4007 人话提示，不假装成功。
+   */
+  async function switchPermission(taskId, preset) {
+    const sessions = service('sessions', 'sessions/get');
+    let session = typeof sessions.get === 'function' ? sessions.get(taskId) : undefined;
+    if (!session && typeof sessions.list === 'function') {
+      const all = sessions.list();
+      session = (Array.isArray(all) ? all : []).find(
+        (s) => s?.id === taskId || s?.sessionId === taskId);
+    }
+    if (!session) {
+      throw fail(4007, '会话当前不在电脑端内存里：先在电脑端打开它，再切换权限');
+    }
+    const presets = service('permissionPresets', 'permissionPresets/set');
+    try {
+      presets.set(session, preset);
+    } catch (err) {
+      // 记下真实宿主异常：真机再失败时可从日志确诊，不靠猜。
+      log(`cordis permission set 失败 ${taskId} ${preset}: ${err?.message ?? String(err)}`);
+      return { kind: 'error', text: err?.message ?? String(err), via: 'preset' };
+    }
+    log(`cordis permission ${taskId} → ${preset}（permissionPresets.set）`);
+    return { kind: 'ok', via: 'preset' };
+  }
+
   /** 进程级权限目录。 */
   async function permissionCatalog() {
     const svc = service('permissionPresets', 'permissionPresets/catalog');
@@ -648,9 +741,23 @@ export function createCordisHost({ ctx, log = () => {}, hostname = os.hostname()
   }
 
   /**
-   * 桌面侧栏的工作区分组（2026-11-19 与桌面 tree.ts 对齐）。
-   * 权威源 = workspaceRegistry.list()（feed.ts 构建 baseline 的同一处）：
-   * 每项 { workspaceId, title, sessionIds, path, createdAt }。
+   * 桌面侧栏的工作区分组（与桌面 tree.ts / WorkspaceFeed 对齐）。
+   *
+   * 权威源 = workspaceRegistry.list()（`WorkspaceFeed.baseline()` 与
+   * `workspaces()` 用的是同一处）。**返回形状以宿主源码为准**：
+   * `list()` 是同步方法，元素是 Workspace 对象
+   * `{ id, title, path, sessionIds: Set<string> }`。
+   *
+   * 2026-11-21 真机返工（分组条三点菜单整条消失）根因就在这两处形状误判：
+   *   1) 之前按 `ws.workspaceId` 取 id —— 字段其实叫 `id`，于是每个工作区都被
+   *      `continue` 跳过，`workspaces` 恒为 `[]`；
+   *   2) 之前用 `Array.isArray(ws.sessionIds)` 判会话归属 —— 它是个 **Set**，
+   *      判空后 bySession 永远为空。
+   * 两处叠加的结果：所有任务 workspaceId 都是 null → 手机端全部退化成
+   * `cwd:` 兜底分组 → 分组头菜单被"非真实工作区"过滤条件全部挡掉。
+   * 实测证据：修复前 `/mobile/v1/tasks` 返回 `items:15, workspaces:[]`。
+   *
+   * 现在两种形状都收（`id ?? workspaceId`、Set 与数组都支持），
    * 拿不到就回空索引——移动端退化为「未分组」，绝不猜 cwd 冒充工作区名。
    */
   function workspaceIndex() {
@@ -662,12 +769,20 @@ export function createCordisHost({ ctx, log = () => {}, hostname = os.hostname()
       const bySession = new Map();
       const groups = [];
       for (const ws of list) {
-        if (!ws || !ws.workspaceId) continue;
-        const title = String(ws.title || '').trim();
+        if (!ws) continue;
+        const id = String(ws.id ?? ws.workspaceId ?? '').trim();
+        if (!id) continue;
+        // 真实宿主是 title；旧快照里出现过 name（mock fixture 同形），两者都认。
+        const title = String(ws.title || ws.name || '').trim();
         if (!title) continue;
-        groups.push({ id: String(ws.workspaceId), name: title });
-        for (const sid of Array.isArray(ws.sessionIds) ? ws.sessionIds : []) {
-          bySession.set(String(sid), { id: String(ws.workspaceId), title });
+        groups.push({ id, name: title });
+        // sessionIds 在宿主里是 Set，别用 Array.isArray 判——那会把归属全丢掉。
+        const ids = ws.sessionIds instanceof Set
+          ? [...ws.sessionIds]
+          : (Array.isArray(ws.sessionIds) ? ws.sessionIds : []);
+        for (const sid of ids) {
+          if (!sid) continue;
+          bySession.set(String(sid), { id, title });
         }
       }
       return { bySession, groups };
@@ -821,7 +936,7 @@ export function createCordisHost({ ctx, log = () => {}, hostname = os.hostname()
       });
     },
 
-    async createTask({ prompt, cwd, attachments } = {}) {
+    async createTask({ prompt, cwd, attachments, permission, provider, model, reasoningEffort } = {}) {
       return call('session/create+prompt', async () => {
         if ((!prompt || !String(prompt).trim()) && !(Array.isArray(attachments) && attachments.length)) {
           throw fail(4400, 'prompt 不能为空');
@@ -833,6 +948,15 @@ export function createCordisHost({ ctx, log = () => {}, hostname = os.hostname()
         if (!sessionId) throw fail(4500, '宿主 create 未返回 sessionId');
         // 新会话还没有任何事件：基线就是 0，从第一条开始都在观察范围内。
         const baseline = await preWriteSeq(sessionId);
+        // 新建会话默认权限（2026-11-20）：必须排在**提交首条提示之前**。
+        // 顺序反了就等于「第一回合仍按电脑端默认策略跑」——用户以为选了只读，
+        // 模型却已经在首回合写过文件了。契约里这个字段一直存在，此前被网关丢掉，
+        // 手机端的权限选择器因此一直是空转的。
+        const permissionApplied = await applyPermissionPreset(sessionId, permission);
+        // 新建会话指定模型（2026-11-21）：与权限同理，必须排在**提交首条提示之前**，
+        // 否则第一句话仍走电脑端默认模型，用户在新建页选的模型等于没选。
+        // 复用宿主 session/selectModel（与详情页模型胶囊同一动作），不另造协议。
+        const modelApplied = await applyInitialModel(sessionId, { provider, model, reasoningEffort });
         const blocks = await attachmentBlocks(sessionId, attachments);
         await submitPrompt(ctrl, sessionId, prompt ? String(prompt) : '', blocks);
         // 新会话立刻进入观察集：宿主 running 标志可能晚一拍，等它就漏掉首条回复。
@@ -841,7 +965,10 @@ export function createCordisHost({ ctx, log = () => {}, hostname = os.hostname()
         // 响应字段按契约补齐。少了 `accepted` 的后果是灾难性的：客户端把它当
         // 必填布尔，解码失败 → 判成可重试 → 队列无限重放同一 submissionId，
         // 界面上就是「新建任务永远发不出去、气泡一直发送中」。
-        return { accepted: true, taskId: sessionId, queued: false, acceptedAt: new Date().toISOString() };
+        return { accepted: true, taskId: sessionId, queued: false, acceptedAt: new Date().toISOString(),
+          // 只有请求了权限才带这个字段（undefined 会被 JSON.stringify 丢掉）——
+          // 客户端据此区分「没要求」与「要求了但电脑端拒绝」。
+          permissionApplied, modelApplied };
       });
     },
 
@@ -974,6 +1101,44 @@ export function createCordisHost({ ctx, log = () => {}, hostname = os.hostname()
     // 宿主码 workspace/session-active（归档运行中会话未带 stopActivity）走
     // HOST_CODE_MAP 默认 4500；归档前由 REST 层显式带 stopActivity=true 规避。
 
+    // MARK: 工作区写动作（2026-11-21，与桌面端分组右键菜单同源）
+    //
+    // app.asar 铁证：桌面端分组三点菜单「重命名 / 删除工作区」走宿主
+    // workspaceController 的 @Remote('rename') / @Remote('delete')，与 pin/archive
+    // 同一个 service、同样单参数无 signal（RPC 元数据 invocation.kind='direct'）。
+    //   · rename({ workspaceId, title }) → WorkspaceValue
+    //   · delete({ workspaceId })        → { deleted: true }
+    // 删除只移除分组注册：文件夹与会话保留，会话落到「未分组」（桌面端 delete.desc
+    // 原文），不是删文件——这点必须在 UI 文案里如实说明。
+    // owner-only 不是障碍：适配器与控制器同处宿主进程，直调视同 owner。
+    async renameWorkspace(workspaceId, { title } = {}) {
+      return call('workspace/rename', async () => {
+        const id = String(workspaceId ?? '').trim();
+        const name = String(title ?? '').trim();
+        if (!id) throw fail(4400, 'workspaceId 不能为空');
+        if (!name) throw fail(4400, '工作区名称不能为空');
+        const ctrl = service('workspaceController', 'workspace/rename');
+        const raw = await ctrl.rename({ workspaceId: id, title: name });
+        const value = unwrapHost(raw);
+        const finalTitle = String(
+          value?.workspace?.title ?? value?.title ?? name);
+        log(`cordis rename workspace=${id} → ${finalTitle}`);
+        return { applied: true, workspaceId: id, title: finalTitle, at: new Date().toISOString() };
+      });
+    },
+
+    async deleteWorkspace(workspaceId) {
+      return call('workspace/delete', async () => {
+        const id = String(workspaceId ?? '').trim();
+        if (!id) throw fail(4400, 'workspaceId 不能为空');
+        const ctrl = service('workspaceController', 'workspace/delete');
+        const raw = await ctrl.delete({ workspaceId: id });
+        unwrapHost(raw);
+        log(`cordis delete workspace=${id}（会话落到未分组，文件保留）`);
+        return { applied: true, workspaceId: id, deleted: true, at: new Date().toISOString() };
+      });
+    },
+
     async pinTask(taskId, { pinned = true } = {}) {
       return call('workspace/pinSession', async () => {
         const ctrl = service('workspaceController', 'workspace/pinSession');
@@ -1047,8 +1212,10 @@ export function createCordisHost({ ctx, log = () => {}, hostname = os.hostname()
   //   · 权限当前值：session/projections → values.permissions.currentValue
   //     （"a configured preset key, `auto`, or `custom`"）；
   //   · 权限可选项：permissionPresets.catalog() → { options: [{value, name, description?}] }；
-  //   · 权限切换：桌面端 PermissionSelect 实证走 `session.command("/permission <preset>")`，
-  //     进程内等价 = commands/execute(sessionId, "/permission x", [])；
+  //   · 权限切换：桌面端 PermissionSelect 走 `session.command("/permission <preset>")`，
+  //     进程内 = commands/execute(**Agent**, "/permission x", [], signal)；
+  //     会话还没起回合（无活体 Agent）时退回 permissionPresets.set(Session, name)
+  //     ——第一个形参是 Agent / Session 对象，不是 id 字符串（见 switchPermission）；
   //   · 模型当前值：session/projections → values.modelSelection.next ?? lastUsed；
   //   · 模型目录：session/modelCatalog() → { default, groups: [{id,name,models}] }；
   //   · 模型切换：session/selectModel({sessionId, provider, model, reasoningEffort?})。
@@ -1112,22 +1279,74 @@ export function createCordisHost({ ctx, log = () => {}, hostname = os.hostname()
     });
   },
 
+  /**
+   * App 级设置目录（2026-11-20）：与「某条会话」无关的进程级两面。
+   *
+   * 手机端设置面板要能先选「新建会话默认权限」和查看「跟随电脑端的模型」，
+   * 而 `GET /tasks/:id/settings` 必须先有会话——第一次打开 App 时一条都没有，
+   * 面板就会空着。permissionPresets / modelCatalog 本来就是**进程级服务**，
+   * 这里直接把两面取出来，不编任何目录。
+   *
+   * 与 sessionSettings 的差别只有一处：没有 currentValue（那是会话级事实）。
+   * 某个面取不到 → supported:false，手机端如实显示「跟随电脑端」。
+   */
+  async appSettings() {
+    return call('app/settings', async () => {
+      const [presets, catalog] = await Promise.all([
+        permissionCatalog().catch((err) => {
+          log(`cordis permissionPresets 失败：${err?.code ?? err?.message ?? 'unknown'}`);
+          return null;
+        }),
+        readModelCatalog().catch((err) => {
+          log(`cordis modelCatalog 失败：${err?.code ?? err?.message ?? 'unknown'}`);
+          return null;
+        }),
+      ]);
+
+      const presetOptions = Array.isArray(presets?.options) ? presets.options : [];
+      const groups = Array.isArray(catalog?.groups) ? catalog.groups : [];
+
+      return {
+        permission: {
+          supported: presetOptions.length > 0,
+          options: presetOptions.map((o) => ({
+            value: o.value,
+            name: o.name,
+            ...(typeof o.description === 'string' ? { description: o.description } : {}),
+          })),
+        },
+        model: {
+          supported: groups.length > 0,
+          default: catalog?.default ?? null,
+          groups: groups.map((g) => ({
+            id: g.id,
+            name: g.name,
+            models: (Array.isArray(g.models) ? g.models : []).map((m) => ({
+              id: m.id,
+              name: m.name,
+              ...(typeof m.description === 'string' ? { description: m.description } : {}),
+              ...(m.reasoning?.defaultEffort ? { defaultEffort: m.reasoning.defaultEffort } : {}),
+            })),
+          })),
+          failures: Array.isArray(catalog?.failures) ? catalog.failures : [],
+        },
+        serverTime: new Date().toISOString(),
+      };
+    });
+  },
+
   async setPermission(taskId, { preset } = {}) {
     return call('permission/switch', async () => {
       const body = String(preset ?? '').trim();
       if (!body) throw fail(4400, 'preset 不能为空');
       await assertTaskExists(taskId);
-      // 与桌面端同一条写路径：`/permission <preset>` 会话命令。
-      // （PermissionSelect 实证：live.command(`/permission ${preset}`)。）
-      const commands = service('commands', 'commands/execute');
-      const raw = await commands.execute(taskId, `/permission ${body}`, []);
-      const outcome = unwrapHost(raw);
-      const result = outcome?.result;
-      if (result?.kind === 'error') {
-        throw fail(4500, `权限切换被宿主拒绝：${result.text ?? '未知原因'}`);
+      // 与桌面端同一条写路径；活体与直写两条分支的取舍见 switchPermission。
+      const switched = await switchPermission(taskId, body);
+      if (switched.kind === 'error') {
+        throw fail(4500, `权限切换被宿主拒绝：${switched.text ?? '未知原因'}`);
       }
-      log(`cordis permission ${taskId} → ${body}`);
-      return { applied: true, taskId, value: body, at: new Date().toISOString() };
+      log(`cordis permission ${taskId} → ${body}（${switched.via}）`);
+      return { applied: true, taskId, value: body, via: switched.via, at: new Date().toISOString() };
     });
   },
 

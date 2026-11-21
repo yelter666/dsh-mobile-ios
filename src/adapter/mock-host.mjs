@@ -26,10 +26,14 @@ export function createMockHost({ log = () => {}, autoPlay = false, speed = 1, da
   const archivedIds = new Set();
   // 会话设置的 mock 状态（2026-11-17 同步面）：权限当前值 + 每任务模型选择。
   const sessionModels = new Map();
+  // 权限目录与桌面端同语义的四档（2026-11-20）：只读 → 工作区 → 全权 → 自动审查。
+  // 真目录来自宿主 `permissionPresets.catalog()`，里面的键与文案由电脑端配置决定；
+  // mock 只是把它摆成桌面端那四档的样子，供设置面板与端到端断言有样本可看。
   const MOCK_PERMISSION_OPTIONS = [
-    { value: 'requireApproval', name: '需审批', description: '每一步写入与命令都需要确认' },
-    { value: 'autoApprove', name: '自动批准', description: '跳过确认，按默认策略执行' },
-    { value: 'readOnly', name: '只读', description: '只允许读取，不改动任何文件' },
+    { value: 'readOnly', name: '仅可查看', description: '只允许读取，不改动任何文件' },
+    { value: 'workspaceWrite', name: '工作区内修改', description: '只能改目标工作区，越界需批准' },
+    { value: 'fullAccess', name: '完全权限', description: '整个文件系统可写，命令不受限' },
+    { value: 'autoReview', name: '自动审查', description: '工具调用自动审查后放行' },
   ];
   const MOCK_MODEL_GROUPS = [
     {
@@ -171,8 +175,16 @@ export function createMockHost({ log = () => {}, autoPlay = false, speed = 1, da
       };
     },
 
-    async createTask({ prompt, title, permission = 'requireApproval', budgetMin = 10, attachments } = {}) {
+    async createTask({ prompt, title, permission, budgetMin = 10, attachments, provider, model } = {}) {
       const taskId = newId('tsk');
+      // 新建会话指定模型（2026-11-21）：与真宿主同口径，请求了就记进会话并在回执里回显。
+      const modelApplied = provider && model ? true : undefined;
+      // 新建会话默认权限（2026-11-20）：与真宿主同口径——未知预设不建会话，
+      // 已知预设就地生效并在回执里说明。缺省按工作区内修改（workspaceWrite）。
+      const preset = permission == null ? null : String(permission).trim();
+      if (preset && !MOCK_PERMISSION_OPTIONS.some((o) => o.value === preset)) {
+        throw fail(4400, `未知权限预设：${preset}`);
+      }
       tasks.set(taskId, {
         taskId,
         storedKey: newId('sk'),
@@ -185,7 +197,7 @@ export function createMockHost({ log = () => {}, autoPlay = false, speed = 1, da
         hostId: hostInfo.hostId,
         hostName: hostInfo.hostName,
         cwd: '/mock/workspace',
-        permission,
+        permission: preset ?? 'workspaceWrite',
         budgetMin,
         needsYou: false,
         pendingTodoCount: 0,
@@ -193,7 +205,9 @@ export function createMockHost({ log = () => {}, autoPlay = false, speed = 1, da
       });
       emit(taskId, 'state', { status: 'running', phase: { index: 1, total: 5, label: '已接收' }, elapsedSec: 0, needsYou: false });
       log(`host  createTask ${taskId}`);
-      return { ...createOk, taskId, storedKey: tasks.get(taskId).storedKey, acceptedAt: new Date().toISOString() };
+      return { ...createOk, taskId, storedKey: tasks.get(taskId).storedKey, acceptedAt: new Date().toISOString(),
+        // 与真宿主同形：请求了权限 / 模型才带这些字段。
+        permissionApplied: preset ? true : undefined, modelApplied };
     },
 
     async appendMessage(taskId, { text, attachments } = {}) {
@@ -253,6 +267,43 @@ export function createMockHost({ log = () => {}, autoPlay = false, speed = 1, da
       finishReason: 'stop',
       at: new Date().toISOString(),
     };
+  },
+
+  // 工作区写动作（与桌面端分组右键菜单同源）：mock 用内存 workspaces 数组模拟
+  // workspaceRegistry，删分组只移除注册、任务行的 workspaceId/Name 清空（落到未分组），
+  // 与桌面端 delete.desc「文件与会话保留，会话显示在未分组下」一致。
+  async renameWorkspace(workspaceId, { title } = {}) {
+    const id = String(workspaceId ?? '').trim();
+    const name = String(title ?? '').trim();
+    if (!id) throw fail(4400, 'workspaceId 不能为空');
+    if (!name) throw fail(4400, '工作区名称不能为空');
+    const ws = workspaces.find((w) => String(w.workspaceId ?? w.id) === id);
+    if (!ws) throw fail(4011, '工作区不存在', { detail: 'workspace/not-found' });
+    // fixture 下发的工作区字段是 {id,name}；真实宿主是 {workspaceId,title}。两种都改，
+    // 列表快照原样下发 workspaces，改错字段会出现「回执说成功、列表名没变」。
+    ws.name = name;
+    ws.title = name;
+    for (const t of tasks.values()) {
+      if (String(t.workspaceId ?? '') === id) t.workspaceName = name;
+    }
+    log(`host  rename workspace ${id} → ${name}`);
+    return { applied: true, workspaceId: id, title: name, at: new Date().toISOString() };
+  },
+
+  async deleteWorkspace(workspaceId) {
+    const id = String(workspaceId ?? '').trim();
+    if (!id) throw fail(4400, 'workspaceId 不能为空');
+    const idx = workspaces.findIndex((w) => String(w.workspaceId ?? w.id) === id);
+    if (idx < 0) throw fail(4011, '工作区不存在', { detail: 'workspace/not-found' });
+    workspaces.splice(idx, 1);
+    for (const t of tasks.values()) {
+      if (String(t.workspaceId ?? '') === id) {
+        t.workspaceId = null;
+        t.workspaceName = null;
+      }
+    }
+    log(`host  delete workspace ${id}（会话落到未分组，文件保留）`);
+    return { applied: true, workspaceId: id, deleted: true, at: new Date().toISOString() };
   },
 
   async pinTask(taskId, { pinned = true } = {}) {
@@ -315,6 +366,23 @@ export function createMockHost({ log = () => {}, autoPlay = false, speed = 1, da
 
   // MARK: 会话设置同步（与 cordis 适配器同形状；mock 恒 supported，供端到端与回归断言）
 
+  /**
+   * App 级设置目录（2026-11-20）：进程级权限目录 + 模型目录，不含会话级当前值。
+   * mock 恒 supported，端到端才能验「设置面板在没会话时也有目录」。
+   */
+  async appSettings() {
+    return {
+      permission: { supported: true, options: MOCK_PERMISSION_OPTIONS },
+      model: {
+        supported: true,
+        default: { provider: 'deepseek', model: 'deepseek-chat' },
+        groups: MOCK_MODEL_GROUPS,
+        failures: [],
+      },
+      serverTime: new Date().toISOString(),
+    };
+  },
+
   async sessionSettings(taskId) {
     if (!tasks.has(taskId)) throw fail(4011);
     const selection = modelOf(taskId);
@@ -322,7 +390,7 @@ export function createMockHost({ log = () => {}, autoPlay = false, speed = 1, da
       taskId,
       permission: {
         supported: true,
-        currentValue: tasks.get(taskId).permission ?? 'requireApproval',
+        currentValue: tasks.get(taskId).permission ?? 'workspaceWrite',
         options: MOCK_PERMISSION_OPTIONS,
       },
       model: {
