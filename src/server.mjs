@@ -85,6 +85,9 @@ export async function createGateway({
   // 隧道子进程的 spawn 实现。默认用 node:child_process；测试注入假进程，
   // 嵌入式场景也可替换（TunnelManager 本身已支持，这里只是让网关能透传）。
   tunnelSpawn = null,
+  // 面板「重新授权」用的 cloudflared 与会话（测试注入；生产走发现链 + 真子进程）
+  loginExecutable = null,
+  loginManager = null,
 } = {}) {
   if (!host) throw new Error('createGateway 需要 host 适配器');
 
@@ -151,6 +154,8 @@ export async function createGateway({
     tunnel,
     tunnelProvisioner,
     hostView,
+    ...(loginExecutable ? { loginExecutable } : {}),
+    ...(loginManager ? { loginManager } : {}),
     // 手机端要填的「电脑地址」（LAN IP:port）；未起或无私网地址时为 null
     lanAddr: () => (listening?.lan ?? null),
   };

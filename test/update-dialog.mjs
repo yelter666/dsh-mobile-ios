@@ -409,12 +409,13 @@ check('改指时提示网关拒绝下发', findByText(modal, '⚠️ CNAME 已�
 closeUpdateModal();
 
 // 凭据不可用（跨账号证书）：2026-11-21 现场。用户只看到一句 cloudflared 命令回显，
-// 以为插件坏了。这里锁住「给出唯一正确的动作：用对的账号 login」。
+// 以为插件坏了。v0.2.19 起改成「一步重新授权」——不再要求用户先会开终端。
 showCredentialHelpModal({
   state: 'zone-missing',
   blocking: true,
   hint: '当前登录的账号里看不到这个域名',
-  accountName: "815353729@qq.com's Account",
+  certAccountName: "815353729@qq.com's Account",
+  certAccountId: 'bb53f02d73b7b0722fca9cbe23bdf10f',
   zoneName: 'matrixboard.cn',
   zoneStatus: 'active',
 });
@@ -422,12 +423,34 @@ modal = lastModal();
 check('凭据弹窗标题点明账号不对', findByText(modal, '登录的 Cloudflare 账号不对').length > 0);
 check('凭据弹窗横幅直接用预检结论', findByText(modal, '⚠️ 当前登录的账号里看不到这个域名').length > 0);
 check('凭据弹窗列出当前证书账号（点破是哪个账号）', findByText(modal, "815353729@qq.com's Account").length > 0);
-check('凭据弹窗给出 tunnel login 命令', containsText(modal, 'cloudflared tunnel login').length > 0);
-check('凭据弹窗说明面板无法代做浏览器授权', containsText(modal, '面板无法代做浏览器授权').length > 0);
-check('凭据弹窗有「重新检测」出口（login 后不用重启插件）',
+check('凭据弹窗把「重新授权」做成主按钮（不用开终端）',
+  allButtons(modal).some((b) => b._text === '重新授权（浏览器）'));
+check('凭据弹窗说清重装/重启/重置都换不掉证书',
+  containsText(modal, '重装插件、重启宿主、点重置都不会换掉证书').length > 0);
+check('凭据弹窗有「重新检测」出口（手动 login 后也能收口）',
   allButtons(modal).some((b) => b._text === '重新检测'));
-check('凭据弹窗有「重置本机状态」兜底（跨机拷贝场景）',
-  allButtons(modal).some((b) => b._text === '重置本机状态'));
+check('凭据弹窗保留「重置本机状态」兜底（跨机拷贝场景）',
+  allButtons(modal).some((b) => String(b._text || '').includes('重置本机状态')));
+closeUpdateModal();
+
+// 授权错了域名：必须指出「证书授权的是哪个域名」，否则用户在自己账号里明明看得到目标域名
+showCredentialHelpModal({
+  state: 'zone-scoped-other',
+  blocking: true,
+  hint: '证书授权的是另一个域名，不是当前的固定地址域名',
+  certZoneName: 'example.com',
+  zoneName: 'matrixboard.cn',
+});
+modal = lastModal();
+check('授权错域名时列出证书真正授权的域名', findByText(modal, 'example.com').length > 0);
+check('授权错域名时提示浏览器里该选哪个账号', containsText(modal, '上次选成了 example.com').length > 0);
+closeUpdateModal();
+
+// 点过「重新检测」但结论没变：标题必须变，否则和「点了没反应」没区别
+showCredentialHelpModal({ state: 'zone-missing', blocking: true, hint: '当前登录的账号里看不到这个域名' }, { again: true });
+modal = lastModal();
+check('重检结论不变时横幅点明「结论没变」',
+  containsText(modal, '重新检测结论没变').length > 0);
 closeUpdateModal();
 
 // 重置是「清本机状态」：必须二次确认，且讲清不动云端
@@ -440,6 +463,65 @@ check('确认框说明不删 cert.pem 与云端记录',
 check('确认框有「确认重置」与「取消」',
   allButtons(modal).some((b) => b._text === '确认重置') && allButtons(modal).some((b) => b._text === '取消'));
 closeUpdateModal();
+
+// ── 按钮真的连到端点上吗 ──────────────────────────────────────
+// 用户现场的原话是「重置本机状态和重新检测点击了都无反应」。除了界面反馈，
+// 这里直接锁「点下去有没有发出对应请求」——按钮画出来但没接线，是最难自查的一类。
+console.log('\n按钮接线（授权 / 重新检测）：\n');
+{
+  const { startTunnelLogin, stopLoginPoll } = exports.__test;
+  const calls = [];
+  const jsonOk = (body) => ({ ok: true, status: 200, json: async () => body });
+  sandbox.fetch = async (url, opts = {}) => {
+    calls.push({ url: String(url), method: opts.method || 'GET' });
+    if (String(url).includes('/health')) return jsonOk({ ok: true, version: '0.2.19' });
+    if (String(url).includes('/desktop/summary')) {
+      return jsonOk({
+        ok: true, version: '0.2.19', hostName: 'Mac mini M4', adapter: 'cordis',
+        pairing: { maxDevices: 5, onlineDevices: 0, activeDevices: 0 },
+        tunnel: {
+          mode: 'named', provisioned: false, state: 'stopped', executable: 'found',
+          credentials: { state: 'zone-missing', blocking: true, hint: '当前登录的账号里看不到这个域名' },
+        },
+      });
+    }
+    if (String(url).includes('/tunnel/login')) {
+      return jsonOk({ state: 'waiting', url: 'https://dash.cloudflare.com/argotunnel?aud=&callback=x', startedAt: null, error: null });
+    }
+    if (String(url).includes('/tunnel/recheck-dns')) {
+      return jsonOk({ provisioned: false, ok: false, credentials: { state: 'zone-missing', blocking: true, hint: '当前登录的账号里看不到这个域名' } });
+    }
+    return jsonOk({});
+  };
+  await probe(); // 让面板找到网关端口（否则 fetchJson 直接抛 gateway-not-found）
+
+  showCredentialHelpModal({ state: 'zone-missing', blocking: true, hint: '当前登录的账号里看不到这个域名' });
+  modal = lastModal();
+  const loginBtn = allButtons(modal).find((b) => b._text === '重新授权（浏览器）');
+  check('凭据弹窗确实有「重新授权」按钮', Boolean(loginBtn));
+  loginBtn.listeners.click[0]();
+  await new Promise((r) => setTimeout(r, 30));
+  check('点「重新授权」会 POST /mobile/v1/tunnel/login',
+    calls.some((c) => c.url.endsWith('/mobile/v1/tunnel/login') && c.method === 'POST'),
+    JSON.stringify(calls.slice(-3)));
+  modal = lastModal();
+  check('随后切到「等待浏览器授权」弹窗', findByText(modal, '等待浏览器授权').length > 0);
+  check('弹窗里带着授权链接（可复制到浏览器）', containsText(modal, 'dash.cloudflare.com/argotunnel').length > 0);
+  stopLoginPoll();
+
+  showCredentialHelpModal({ state: 'zone-missing', blocking: true, hint: '当前登录的账号里看不到这个域名' });
+  modal = lastModal();
+  const recheckBtn = allButtons(modal).find((b) => b._text === '重新检测');
+  recheckBtn.listeners.click[0]();
+  await new Promise((r) => setTimeout(r, 30));
+  check('点「重新检测」会 POST /mobile/v1/tunnel/recheck-dns',
+    calls.some((c) => c.url.endsWith('/mobile/v1/tunnel/recheck-dns') && c.method === 'POST'),
+    JSON.stringify(calls.slice(-3)));
+  modal = lastModal();
+  check('结论没变时要明说「结论没变」（否则等同点了没反应）',
+    containsText(modal, '重新检测结论没变').length > 0);
+  closeUpdateModal();
+}
 
 console.log(`\n结果：${pass} 通过 / ${failures.length} 失败`);
 if (failures.length) process.exit(1);

@@ -271,6 +271,9 @@ bash spike0/run-demo.sh            # 自动起服务 → 造 3 帧 → 跑客户
 | `POST /mobile/v1/tunnel/provision` | 开通固定地址（幂等）。写 DNS 前先做凭据预检，见 9.1 |
 | `POST /mobile/v1/tunnel/recheck-dns` | 强制重探解析 + 强制刷新凭据预检（解开「解析异常」自锁死） |
 | `POST /mobile/v1/tunnel/reset` | 清本机固定地址状态与 ingress（不碰 cert.pem、不删云端隧道），幂等 |
+| `POST /mobile/v1/tunnel/login` | 发起 Cloudflare 浏览器授权（起 `cloudflared tunnel login`，返回授权链接），幂等 |
+| `GET /mobile/v1/tunnel/login` | 授权进度：`idle/waiting/ok/error/canceled` + 链接 + 失败原因 |
+| `POST /mobile/v1/tunnel/login/cancel` | 取消等待中的授权并回收子进程 |
 | `POST /mobile/v1/tunnel/install-cloudflared` | 用户同意后从官方源自举安装 cloudflared 到私有目录 |
 | `GET /mobile/v1/diag/bundle` | 脱敏诊断包，含可直接粘贴的 `text` 字段 |
 
@@ -296,10 +299,32 @@ bash spike0/run-demo.sh            # 自动起服务 → 造 3 帧 → 跑客户
 
 诊断矩阵（`TunnelStatus.credentials.state`）：`ok` / `missing`（没有 cert） / `unreadable`（解析不了，降级）
 / `no-token`（旧版证书，降级） / `forbidden`（403） / `zone-missing`（这账号看不到域名） /
-`account-mismatch`（证书账号 ≠ zone 账号） / `stale-zone`（证书指向已被重建的 zone） /
-`zone-moved`（域名被另一账号接管） / `unknown`（网络不可达）。
+`zone-scoped-other`（证书授权的是**另一个域名**） / `account-mismatch`（证书账号 ≠ zone 账号） /
+`stale-zone`（证书指向已被重建/删除的 zone） / `zone-moved`（域名被另一账号接管） / `unknown`（网络不可达）。
 
-唯一正确的修法只有一个：**用持有该域名的账号重跑 `cloudflared tunnel login`**。
+`zone-missing` 与 `zone-scoped-other` 的区别很关键：前者是账号里真没有这个域名，后者是
+**登录时在浏览器里点错了域名**（zone 范围的 token 只覆盖被授权的那一把 zone）。两种情况都要
+重新授权，但后者必须在提示里点名「上次授权的是 xxx」。预检因此额外回传
+`certAccountName` / `certZoneName`——否则用户在自己的账号里明明看得到目标域名，无从判断
+「我刚跑的 login 到底生效了没有」。
+
+### 9.2 一键重新授权（0.2.19）
+
+唯一正确的修法只有一个：**用持有该域名的账号重新授权**。但它需要人在浏览器里点「允许」，
+所以插件把这一步做成了一条路，而不是一句终端命令（现场教训：用户重装、重启、点重置、
+点重新检测全都无效——这些动作**都不会换掉 cert.pem**）：
+
+| 步骤 | 谁做 | 实现 |
+|---|---|---|
+| 点「重新授权（浏览器）」 | 用户 | 面板 `startTunnelLogin` → `POST /tunnel/login` |
+| 起 `cloudflared tunnel login`、捞授权链接 | 网关 | `cloudflared-login.mjs`（进程级单例，幂等） |
+| 浏览器里选账号并授权 | 用户 | 链接来自 cloudflared 输出；面板提供「复制授权链接」 |
+| 轮询结果 → 强制重检 → 继续开通 | 面板 | `pollLogin` 每 1.5 秒一次，成功后 `afterLoginOk` |
+
+四条不变量：幂等（等待中重复点不起第二个授权）、不静默（超时/退出码非 0/退出但没生成证书
+都有可读原因，且保留 cloudflared 最后几行而不是第一行）、不留孤儿（取消或超时 kill 子进程）、
+只覆盖 `HOME`（证书一定落在本机真正使用的 `~/.cloudflared`）。
+
 换账号后 `ensure()` 会自动识别账号变更、重建隧道并**沿用同一个子域**（地址不变、无需重新配对）。
 
 ## 10. 下一步

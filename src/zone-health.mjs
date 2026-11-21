@@ -254,6 +254,7 @@ export const CREDENTIAL_STATE_HINT = {
   'no-token': 'cert.pem 里没有可用的 zone token（旧版证书）',
   forbidden: '登录的 Cloudflare 账号没有这个域名的权限',
   'zone-missing': '当前登录的账号里看不到这个域名',
+  'zone-scoped-other': '证书授权的是另一个域名，不是当前的固定地址域名',
   'account-mismatch': '证书所属账号与域名所在账号不是同一个',
   'stale-zone': 'cert.pem 指向的 zone 已失效（域名可能被删后重新接入）',
   'zone-moved': '域名已被另一个 Cloudflare 账号接管',
@@ -261,7 +262,38 @@ export const CREDENTIAL_STATE_HINT = {
 };
 
 /** 这些状态是「确定不可用」：可以放心在写 DNS 之前拦下，并给出对应修法。 */
-const BLOCKING_STATES = new Set(['missing', 'forbidden', 'zone-missing', 'account-mismatch', 'stale-zone', 'zone-moved']);
+const BLOCKING_STATES = new Set([
+  'missing', 'forbidden', 'zone-missing', 'zone-scoped-other', 'account-mismatch', 'stale-zone', 'zone-moved',
+]);
+
+/**
+ * 证书「看得到账号、却列不出这个域名」时，把证书真正授权的那把 zone 与账号名问出来。
+ *
+ * 为什么需要：`cloudflared tunnel login` 让人在浏览器里**选一个域名**，证书 token
+ * 只覆盖那一个 zone。如果当时点的是别的域名，`/zones?name=<目标>` 会返回空数组，
+ * 面板只能说「账号里看不到这个域名」——用户看着自己账号里明明有这个域名，无从下手。
+ * 问出「授权的是 xxx」之后，一句话就能说清下一步该做什么。
+ *
+ * 全部 best-effort：任何一步失败都不影响结论，只是少一句话。
+ */
+async function probeCertScope(apiBase, cert, fetchImpl, timeoutMs) {
+  const out = { zoneName: null, zoneStatus: null, zoneGone: false, accountName: null };
+  if (cert.zoneId) {
+    const z = await cfRequest(apiBase, cert.apiToken, `/zones/${cert.zoneId}`, fetchImpl, timeoutMs);
+    if (z.ok && z.success) {
+      out.zoneName = z.result?.name || null;
+      out.zoneStatus = z.result?.status || null;
+    } else if (z.reached && (z.status === 400 || z.status === 404)) {
+      // 400 = Invalid zone identifier（zone 被删过），404 = 不存在
+      out.zoneGone = true;
+    }
+  }
+  if (cert.accountId) {
+    const a = await cfRequest(apiBase, cert.apiToken, `/accounts/${cert.accountId}`, fetchImpl, timeoutMs);
+    if (a.ok && a.success) out.accountName = a.result?.name || null;
+  }
+  return out;
+}
 
 /**
  * 带 HTTP 状态的只读请求（cfGet 只关心 result，这里需要区分 403 与「断网」）。
@@ -327,6 +359,8 @@ export async function verifyCertAccess({
     zoneName: baseDomain || null,
     zoneStatus: null,
     certAccountId: null,
+    certAccountName: null,
+    certZoneName: null,
     zoneId: null,
     detail: null,
   };
@@ -370,17 +404,58 @@ export async function verifyCertAccess({
   }
 
   const zones = Array.isArray(list.result) ? list.result : [];
-  const zone = zones.find((z) => z && String(z.name).toLowerCase() === baseDomain.toLowerCase()) || null;
+  let zone = zones.find((z) => z && String(z.name).toLowerCase() === baseDomain.toLowerCase()) || null;
   if (!zone) {
-    // 空列表 = 这个 token 看不到该域名（zone 范围的 token 只列得出自己那把 zone）
-    return {
+    // 空列表 = 这个 token 看不到该域名。但「看不到」有三种完全不同的原因，
+    // 用户要做的事也不同，所以必须多问一句「证书到底授权给了谁」：
+    //   · 登录时在浏览器里选了别的域名 → zone-scoped-other（重登录并选对域名）
+    //   · 那把 zone 已被删除（域名删掉后重新接入会换 zoneID）→ stale-zone
+    //   · 权限/账号问题 → zone-missing
+    // 顺带把证书账号名带回来：面板原来在这一步什么都不显示，用户无法确认
+    // 「我刚跑的 tunnel login 到底生效了没有」。
+    const scope = await probeCertScope(apiBase, cert, fetchImpl, timeoutMs);
+    const ident = {
       ...base,
-      state: 'zone-missing',
-      blocking: true,
-      hint: CREDENTIAL_STATE_HINT['zone-missing'],
       certAccountId: cert.accountId || null,
-      detail: `证书指向 zone ${String(cert.zoneId || '未知').slice(0, 8)}…，但它已不在任何可访问的 ${baseDomain} 之下`,
+      certAccountName: scope.accountName,
+      certZoneName: scope.zoneName,
     };
+    if (scope.zoneName && scope.zoneName.toLowerCase() === baseDomain.toLowerCase()) {
+      // 按 ID 能读到、按名字列不出：token 权限怪，但证书本身确实指向这个域名。
+      // 这种情况不能拦（拦了就是误杀），继续走正常判定。
+      const byId = await cfRequest(apiBase, cert.apiToken, `/zones/${cert.zoneId}`, fetchImpl, timeoutMs);
+      zone = byId.ok && byId.success ? byId.result : null;
+      if (!zone) return { ...ident, detail: '按 ID 读取 zone 失败' };
+    } else if (scope.zoneName) {
+      return {
+        ...ident,
+        state: 'zone-scoped-other',
+        blocking: true,
+        hint: CREDENTIAL_STATE_HINT['zone-scoped-other'],
+        zoneName: scope.zoneName,
+        zoneStatus: scope.zoneStatus,
+        detail: `证书授权的是 ${scope.zoneName}，不是 ${baseDomain}。`
+          + `重新执行 cloudflared tunnel login，并在浏览器里选择 ${baseDomain}。`,
+      };
+    } else if (scope.zoneGone) {
+      return {
+        ...ident,
+        state: 'stale-zone',
+        blocking: true,
+        hint: CREDENTIAL_STATE_HINT['stale-zone'],
+        detail: `证书里的 zone ${String(cert.zoneId || '').slice(0, 8)}… 在 Cloudflare 上已不存在`
+          + `（域名删掉后重新接入会换 zoneID）。重新执行 cloudflared tunnel login 即可换新证书。`,
+      };
+    } else {
+      return {
+        ...ident,
+        state: 'zone-missing',
+        blocking: true,
+        hint: CREDENTIAL_STATE_HINT['zone-missing'],
+        detail: `证书账号 ${scope.accountName || String(cert.accountId || '未知').slice(0, 8)} 下没有 ${baseDomain}。`
+          + '要么用持有该域名的账号重新授权，要么把域名加到当前账号再重试。',
+      };
+    }
   }
 
   const zoneAccountId = zone.account?.id || null;
@@ -397,6 +472,8 @@ export async function verifyCertAccess({
     zoneName: zone.name || baseDomain,
     zoneStatus: zone.status || null,
     certAccountId: cert.accountId || null,
+    certAccountName: accountName,
+    certZoneName: zone.name || null,
     zoneId: zone.id || null,
   };
   if (accountMismatch) {

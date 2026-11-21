@@ -4,10 +4,13 @@
 import { fail, ERRORS, newId } from './protocol.mjs';
 import { translateRecords } from './adapter/session-history.mjs';
 import { createRequire } from 'node:module';
+import os from 'node:os';
 import { PLUGIN_VERSION } from './version.mjs';
 import { ensureCloudflared, resolveAsset } from './cloudflared-install.mjs';
 import { selfUpdatePlugin } from './plugin-update.mjs';
 import { resolveNs } from './dns-probe.mjs';
+import { createLoginManager } from './cloudflared-login.mjs';
+import { findCloudflared } from './tunnel.mjs';
 
 // QR 编码（vendor：qrcode-generator 1.4.4，MIT，零依赖；见 lib/vendor/，
 // .cjs 后缀：包为 type:module，require 需显式 CommonJS）
@@ -102,6 +105,8 @@ const DESKTOP_CORS_PATHS = [
   /^\/mobile\/v1\/tunnel\/install-cloudflared$/,
   /^\/mobile\/v1\/tunnel\/recheck-dns$/,
   /^\/mobile\/v1\/tunnel\/reset$/,
+  /^\/mobile\/v1\/tunnel\/login$/,
+  /^\/mobile\/v1\/tunnel\/login\/cancel$/,
   /^\/mobile\/v1\/plugin\/self-update$/,
 ];
 
@@ -150,6 +155,22 @@ export function createRestRouter({ core, pairing, host, tickets, config = {}, lo
 
   const routes = [];
   const route = (method, pattern, handler) => routes.push({ method, pattern, handler });
+
+  /**
+   * 浏览器授权会话（`cloudflared tunnel login`）。
+   *
+   * 放在网关而不是面板：起子进程、读 HOME、等回调都只能在主机侧做；面板只负责
+   * 把链接摆出来并在结果出来后继续开通。会话是**进程级单例**——重复点不会开第二个
+   * 浏览器授权页（现场最容易踩的坑：点两次，两个 cloudflared 抢同一个 cert.pem）。
+   */
+  const loginManager = config.loginManager || createLoginManager({ log });
+
+  /** 授权用的 cloudflared 与开通用同一套发现链：能开通却找不到 login 的二进制没意义。 */
+  const loginExecutable = () => {
+    if (typeof config.loginExecutable === 'function') return config.loginExecutable();
+    const hint = config.tunnelProvisioner?.executable || 'auto';
+    return findCloudflared(hint, process.env) || findCloudflared('auto', process.env) || null;
+  };
 
   /**
    * 诊断包（GW-9）。
@@ -267,6 +288,9 @@ export function createRestRouter({ core, pairing, host, tickets, config = {}, lo
       // 凭据预检结论（local 形态才有）：state=障碍类型，blocking=是否**确定**不可写。
       // 面板因此能在用户点「开启远程」之前就提示「登录的账号不对」，而不是等写 DNS 才崩。
       credentials: prov?.credentials ?? null,
+      // 浏览器授权的进度（idle/waiting/ok/error/canceled）。面板刷新/重载后能凭它
+      // 恢复「正在等授权」的界面，不会让用户以为按钮点了没反应。
+      login: loginManager.status(),
       // 面板据此决定是否显示「自动安装 cloudflared」入口：仅在缺失且有官方构建时为 true。
       canAutoInstall: base.executable === 'missing' && !!resolveAsset({}),
     };
@@ -602,6 +626,46 @@ export function createRestRouter({ core, pairing, host, tickets, config = {}, lo
     const result = await prov.reset();
     log(`rest  tunnel reset 完成 hadState=${result.hadState} removed=${(result.removed || []).join(',') || '（无文件）'}`);
     return send(ctx.res, 200, { ...result, status: tunnelSnapshot() }, DESKTOP_CORS);
+  });
+
+  /**
+   * 发起 Cloudflare 浏览器授权（面板「重新授权」按钮）。
+   *
+   * 边界与开通同一道门（回环-only）：这一步会起子进程并让浏览器拿到一次账号授权，
+   * 公网上的任何人都不能触发。返回里带 `url`——面板即使拿不到系统浏览器，也能把
+   * 链接复制出去在任意设备上完成授权（回调仍是本机 localhost，所以必须同机浏览器）。
+   */
+  route('POST', /^\/mobile\/v1\/tunnel\/login$/, async (ctx) => {
+    loopbackOnly(ctx, 'Cloudflare 授权只允许在主机本机操作');
+    const executable = loginExecutable();
+    if (!executable) {
+      throw fail(4021, '这台主机还没有 cloudflared，先安装再授权', {
+        method: 'tunnel.login',
+        detail: '面板「安装 cloudflared」或在这台电脑终端执行 brew install cloudflared',
+      });
+    }
+    let status;
+    try {
+      status = loginManager.start({ executable, homeDir: os.homedir() });
+    } catch (err) {
+      throw fail(4500, err?.message || '无法发起 Cloudflare 授权', { method: 'tunnel.login' });
+    }
+    log(`rest  tunnel login ${status.state}${status.url ? '（已给出链接）' : '（等待输出链接）'}`);
+    return send(ctx.res, 200, status, DESKTOP_CORS);
+  });
+
+  /** 查询授权进度（面板每 1.5 秒轮询一次；状态机在 cloudflared-login.mjs）。 */
+  route('GET', /^\/mobile\/v1\/tunnel\/login$/, async (ctx) => {
+    loopbackOnly(ctx, 'Cloudflare 授权状态只允许在主机本机读取');
+    return send(ctx.res, 200, loginManager.status(), DESKTOP_CORS);
+  });
+
+  /** 取消授权：kill 掉等待中的 cloudflared，避免用户关了弹窗它还在后台等。 */
+  route('POST', /^\/mobile\/v1\/tunnel\/login\/cancel$/, async (ctx) => {
+    loopbackOnly(ctx, 'Cloudflare 授权只允许在主机本机操作');
+    const status = loginManager.cancel();
+    log(`rest  tunnel login cancel → ${status.state}`);
+    return send(ctx.res, 200, status, DESKTOP_CORS);
   });
 
   /**

@@ -177,8 +177,14 @@ export class LocalProvisioner {
       blocking: Boolean(verdict.blocking),
       hint: verdict.hint ?? null,
       accountName: verdict.accountName ?? null,
+      // 「证书账号」与「域名所在账号」在跨账号场景下是两个名字，面板必须都能显示：
+      // 只给域名账号名时，用户看不出自己刚跑的 tunnel login 到底切没切成功。
+      certAccountName: verdict.certAccountName ?? null,
+      certAccountId: verdict.certAccountId ?? null,
+      certZoneName: verdict.certZoneName ?? null,
       zoneName: verdict.zoneName ?? null,
       zoneStatus: verdict.zoneStatus ?? null,
+      detail: verdict.detail ?? null,
       checkedAt: this._auth?.at ? new Date(this._auth.at).toISOString() : null,
     };
   }

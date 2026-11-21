@@ -96,6 +96,42 @@ console.log('\n1) 凭据预检：五种「确定不可用」各给出不同结�
   check('token 看不到该域名 → zone-missing 且阻断', cross.state === 'zone-missing' && cross.blocking === true, JSON.stringify(cross));
   check('zone-missing 的提示点明「账号里看不到这个域名」', /看不到这个域名/.test(cross.hint || ''), cross.hint);
 
+  // 「账号里明明有这个域名」的另一种真相：登录时在浏览器里选错了域名。
+  // zone 范围的 token 只覆盖被授权的那一把 zone，所以按名字查目标域名必然是空列表。
+  // 面板必须能说出「你授权的是哪个域名」，否则用户只能在自己的账号里反复确认。
+  const scopedFetch = stubFetch([
+    [/\/zones\?name=/, () => okBody([])],
+    [/\/zones\/[0-9a-f]{32}/, () => okBody({ id: ZONE_ID, name: 'other-site.com', status: 'active' })],
+    [/\/accounts\//, () => okBody({ id: OTHER_ACCOUNT, name: "815353729@qq.com's Account" })],
+  ]);
+  const scoped = await verifyCertAccess({ homeDir: home, baseDomain: 'matrixboard.cn', fetchImpl: scopedFetch });
+  check('证书授权的是另一个域名 → zone-scoped-other 且阻断',
+    scoped.state === 'zone-scoped-other' && scoped.blocking === true, JSON.stringify(scoped));
+  check('带出证书真正授权的域名', scoped.certZoneName === 'other-site.com', String(scoped.certZoneName));
+  check('带出证书所属账号名（面板要能显示「你现在是哪个账号」）',
+    scoped.certAccountName === "815353729@qq.com's Account", String(scoped.certAccountName));
+  check('detail 直接说该重新授权并选择目标域名', /other-site\.com/.test(scoped.detail || ''), scoped.detail);
+
+  // zone 被删掉后重新接入：cert 里的 zoneID 在 Cloudflare 上已不存在（HTTP 400）
+  const goneFetch = stubFetch([
+    [/\/zones\?name=/, () => okBody([])],
+    [/\/zones\/[0-9a-f]{32}/, () => errBody(400, [{ code: 1049, message: 'Invalid zone identifier' }])],
+    [/\/accounts\//, () => okBody({ name: 'old-account' })],
+  ]);
+  const gone = await verifyCertAccess({ homeDir: home, baseDomain: 'matrixboard.cn', fetchImpl: goneFetch });
+  check('证书里的 zone 已不存在 → stale-zone 且阻断',
+    gone.state === 'stale-zone' && gone.blocking === true, JSON.stringify(gone));
+
+  // 按名字列不出、按 ID 却读得到同一把 zone：属于 token 权限怪，**不能拦**（拦了就是误杀）
+  const byIdFetch = stubFetch([
+    [/\/zones\?name=/, () => okBody([])],
+    [/\/zones\/[0-9a-f]{32}/, () => okBody({ id: ZONE_ID, name: 'matrixboard.cn', status: 'active', account: { id: ACCOUNT } })],
+    [/\/accounts\//, () => okBody({ name: "yelter@qq.com's Account" })],
+  ]);
+  const byId = await verifyCertAccess({ homeDir: home, baseDomain: 'matrixboard.cn', fetchImpl: byIdFetch });
+  check('按名字列不出但按 ID 读得到目标域名 → ok（不误杀）',
+    byId.state === 'ok' && byId.blocking === false, JSON.stringify(byId));
+
   const forbidding = stubFetch([[/\/zones\?name=/, () => errBody(403)]]);
   const forbidden = await verifyCertAccess({ homeDir: home, baseDomain: 'matrixboard.cn', fetchImpl: forbidding });
   check('403 → forbidden 且阻断', forbidden.state === 'forbidden' && forbidden.blocking === true, JSON.stringify(forbidden));
@@ -467,6 +503,19 @@ console.log('\n10) REST：凭据结论进 summary，reset 回环-only 且幂等\
 
   const port = Number(process.env.PORT || 3187) + 21;
   const fake = fakeTunnel('named');
+  // 授权会话用假实现：真实现会起 cloudflared 并调起浏览器，不能进测试。
+  // 这里只验「REST 三个端点是否把会话状态如实摆给面板」。
+  const loginStub = (() => {
+    let st = { state: 'idle', url: null, startedAt: null, finishedAt: null, pid: null, error: null, hint: null };
+    return {
+      start: () => {
+        st = { ...st, state: 'waiting', url: 'https://dash.cloudflare.com/argotunnel?aud=&callback=http%3A%2F%2Flocalhost%3A1', startedAt: new Date().toISOString(), pid: 999 };
+        return st;
+      },
+      cancel: () => { st = { ...st, state: 'canceled' }; return st; },
+      status: () => st,
+    };
+  })();
   const gw = await createGateway({
     host: createMockHost(),
     port,
@@ -475,6 +524,8 @@ console.log('\n10) REST：凭据结论进 summary，reset 回环-only 且幂等\
     tunnelExecutable: fake.executable,
     tunnelSpawn: fake.spawnImpl,
     tunnelProvisioner: prov,
+    loginExecutable: () => '/opt/homebrew/bin/cloudflared',
+    loginManager: loginStub,
   });
   const { port: livePort } = await gw.start();
   try {
@@ -496,6 +547,27 @@ console.log('\n10) REST：凭据结论进 summary，reset 回环-only 且幂等\
     const again = await httpJson({ port: livePort, method: 'POST', path: '/mobile/v1/tunnel/reset' });
     check('重复 reset 幂等', again.status === 200 && again.body?.hadState === false, JSON.stringify(again.body));
     check('reset 后不再宣称已开通', again.body?.status?.provisioned === false);
+
+    // 一键授权：面板点「重新授权」走这三个端点。守卫必须与开通同门——
+    // 这一步会让浏览器拿到一次账号授权，公网来源绝不允许触发。
+    const loginBlocked = await httpJson({
+      port: livePort, method: 'POST', path: '/mobile/v1/tunnel/login',
+      headers: { 'CF-Ray': '8fakelax', 'CF-Connecting-IP': '203.0.113.9' },
+    });
+    check('隧道来源不能发起授权（管理面守卫）', loginBlocked.status === 403 && loginBlocked.body?.error?.code === 4003, JSON.stringify(loginBlocked.body));
+
+    const started = await httpJson({ port: livePort, method: 'POST', path: '/mobile/v1/tunnel/login' });
+    check('本机可以发起授权并拿到链接', started.status === 200 && /dash\.cloudflare\.com\/argotunnel/.test(started.body?.url || ''), JSON.stringify(started.body));
+    check('发起后状态是 waiting', started.body?.state === 'waiting', String(started.body?.state));
+
+    const polled = await httpJson({ port: livePort, path: '/mobile/v1/tunnel/login' });
+    check('轮询端点返回同一会话（面板据此显示等待中）', polled.body?.state === 'waiting' && Boolean(polled.body?.url), JSON.stringify(polled.body));
+
+    const summaryWithLogin = await httpJson({ port: livePort, path: '/mobile/v1/desktop/summary' });
+    check('summary 带出授权进度（重载后能恢复「正在等授权」）', summaryWithLogin.body?.tunnel?.login?.state === 'waiting', JSON.stringify(summaryWithLogin.body?.tunnel?.login));
+
+    const canceled = await httpJson({ port: livePort, method: 'POST', path: '/mobile/v1/tunnel/login/cancel' });
+    check('取消授权返回 canceled', canceled.status === 200 && canceled.body?.state === 'canceled', JSON.stringify(canceled.body));
   } finally {
     await gw.stop();
   }
