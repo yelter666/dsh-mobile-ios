@@ -25,10 +25,13 @@ import { deriveSubdomain, isValidLabel } from './dns-label.mjs';
 import { dnsWarningFor, evaluateDnsAnswer, probeDns, resolveNs } from './dns-probe.mjs';
 import { cnameBelongsTo, readZoneCert } from './zone-health.mjs';
 import { findCloudflared } from './tunnel.mjs';
+import { explainTunnelFailure } from './tunnel-error.mjs';
+import { hasLocalCredentials, isForeignState, machineIdentity, readState, writeState } from './tunnel-state.mjs';
 
 const execFileAsync = promisify(nodeExecFile);
 const CLI_TIMEOUT_MS = 45_000;
-const STATE_VERSION = 1;
+// 凭据预检的缓存时长：够短（重新 login 后一分钟内生效），够长（不会每次开隧道都打 API）。
+const AUTH_TTL_MS = 120_000;
 
 const UUID_PATTERN = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
 
@@ -48,26 +51,8 @@ function isLiveTunnel(t) {
   return String(deleted).startsWith('0001-01-01');
 }
 
-function readState(file, log) {
-  if (!file) return null;
-  try {
-    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (!parsed || parsed.version !== STATE_VERSION) throw new Error('结构不符');
-    return parsed;
-  } catch (err) {
-    if (err.code !== 'ENOENT') log?.(`tunnel 本地开通状态不可用：${err.message}`);
-    return null;
-  }
-}
-
-function writeState(file, state) {
-  if (!file) return;
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ version: STATE_VERSION, ...state }, null, 2), { mode: 0o600, flag: 'w' });
-  fs.renameSync(tmp, file);
-  try { fs.chmodSync(file, 0o600); } catch { /* 刚写即 0600 */ }
-}
+// 状态读写统一走 tunnel-state.mjs：那里同时负责「这份状态是不是本机的」，
+// 否则跨机拷贝的 tunnel-named.json 会让新机器对外宣称一个指向旧机器的地址。
 
 /** cloudflared 的 ingress 配置文件。ports/hostname 变一次就要重写一次。 */
 export function renderConfig({ tunnelId, credentialsFile, hostname, port }) {
@@ -124,6 +109,11 @@ export class LocalProvisioner {
     zoneDiagnose = null,
     // 可注入：开通前查这条 hostname 现在指向哪条隧道，避免多机互相覆盖。
     ownerLookup = null,
+    // 可注入：开通前预检「这本 cert.pem 能不能写这个域名的 DNS」。
+    // 不注入就不预检（测试/离线保持零网络依赖）；生产由 createProvisioner 注入。
+    verifyAccess = null,
+    // 可注入：本机主机名（只用于状态里记录机器身份，便于排障时看出「拷来的状态」）
+    hostname = null,
   } = {}) {
     this.baseDomain = String(baseDomain).replace(/^\./, '').toLowerCase();
     this.prefix = prefix;
@@ -135,11 +125,15 @@ export class LocalProvisioner {
     this.env = env;
     this.log = log;
     this._state = undefined;
+    this._machine = undefined;
+    this._auth = null; // { at, fp, verdict } —— 凭据预检结果缓存（不含 token）
+    this.hostnameHint = hostname;
     // 可注入，测试里不必真起 cloudflared
     this.run = run || this.#exec;
     this.probe = probe || probeDns;
     this.zoneDiagnose = zoneDiagnose;
     this.ownerLookup = ownerLookup;
+    this.verifyAccess = verifyAccess;
     this._zone = null; // 最近一次 zone 诊断结论（不含凭据）
   }
 
@@ -152,10 +146,92 @@ export class LocalProvisioner {
     return this._state;
   }
 
+  /** 本机身份（首次调用会生成 machine-id）；目录不可写时为 null。 */
+  get machine() {
+    if (this._machine === undefined) {
+      try {
+        this._machine = machineIdentity({ stateFile: this.stateFile, hostname: this.hostnameHint });
+      } catch {
+        this._machine = null;
+      }
+    }
+    return this._machine;
+  }
+
   get configured() {
     // 本地形态只要证书在就算可开通；已开通则要配置与凭据都在
     if (this.state?.configFile) return true;
     return fs.existsSync(path.join(this.homeDir, '.cloudflared', 'cert.pem'));
+  }
+
+  /** 最近一次凭据预检结论（面板展示用；未预检过为 null）。不含 token。 */
+  get credentials() {
+    if (!this._auth?.verdict) return null;
+    return this.#authSnapshot(this._auth.verdict);
+  }
+
+  #authSnapshot(verdict) {
+    if (!verdict) return null;
+    return {
+      state: verdict.state || 'unknown',
+      blocking: Boolean(verdict.blocking),
+      hint: verdict.hint ?? null,
+      accountName: verdict.accountName ?? null,
+      zoneName: verdict.zoneName ?? null,
+      zoneStatus: verdict.zoneStatus ?? null,
+      checkedAt: this._auth?.at ? new Date(this._auth.at).toISOString() : null,
+    };
+  }
+
+  #certFingerprint() {
+    const file = path.join(this.homeDir, '.cloudflared', 'cert.pem');
+    try {
+      const st = fs.statSync(file);
+      return `${st.size}:${Math.round(st.mtimeMs)}`;
+    } catch {
+      return 'none';
+    }
+  }
+
+  /**
+   * 凭据预检：当前 cert.pem 能不能管理 baseDomain。
+   *
+   * 只在**要写 Cloudflare** 的路径上作为硬门槛；日常启动命中缓存时只用于提示，
+   * 绝不因为「账号对不上」去拦一个本来能跑的隧道（cloudflared 运行时只需要
+   * credentials 文件，不需要 cert.pem）。
+   */
+  async checkCredentials({ force = false } = {}) {
+    if (typeof this.verifyAccess !== 'function') {
+      return { state: 'unknown', blocking: false, hint: null, accountName: null, checkedAt: null };
+    }
+    const fp = this.#certFingerprint();
+    const now = Date.now();
+    if (!force && this._auth && this._auth.fp === fp && now - this._auth.at < AUTH_TTL_MS) {
+      return this.#authSnapshot(this._auth.verdict);
+    }
+    let verdict = null;
+    try {
+      verdict = await this.verifyAccess({ homeDir: this.homeDir, baseDomain: this.baseDomain });
+    } catch (err) {
+      verdict = { state: 'unknown', blocking: false, hint: null, detail: err?.message || String(err) };
+    }
+    if (!verdict || typeof verdict !== 'object') verdict = { state: 'unknown', blocking: false, hint: null };
+    this._auth = { at: now, fp, verdict };
+    if (verdict.blocking) this.log(`tunnel 凭据预检未通过（${verdict.state}）：${verdict.hint || ''}`);
+    return this.#authSnapshot(verdict);
+  }
+
+  /** 凭据不可用时抛出的统一错误（带可执行修法）。 */
+  #credentialError(verdict) {
+    const hint = verdict?.hint || '当前登录的 Cloudflare 账号无法管理这个域名';
+    const exe = findCloudflared(this.executable, this.env) || findCloudflared('auto', this.env) || this.executable;
+    const account = verdict?.accountName ? `（当前证书属于 ${verdict.accountName}）` : '';
+    return fail(4021, `${hint}${account}`, {
+      detail: `在这台电脑的终端执行：${exe} tunnel login，`
+        + `在浏览器里选择持有 ${this.baseDomain} 的账号完成授权（会覆盖 ~/.cloudflared/cert.pem），`
+        + '然后回到面板重新点「开启远程」。重装插件、重启宿主、改 NS 都不能替代这一步。',
+      reason: 'credentials',
+    });
   }
 
   get notConfiguredMessage() {
@@ -235,7 +311,10 @@ export class LocalProvisioner {
 
   status() {
     const s = this.state;
-    if (!s) return { kind: 'local', provisioned: false, hostname: null, url: null, tunnelId: null };
+    // credentials 是「预检结论」，未预检过就是 null——面板据此决定要不要提示
+    // 「账号对不上」。它不是开通状态的替代品：隧道能跑 ≠ 能改写 DNS。
+    const credentials = this.credentials;
+    if (!s) return { kind: 'local', provisioned: false, hostname: null, url: null, tunnelId: null, credentials };
     return {
       kind: 'local',
       provisioned: true,
@@ -250,6 +329,7 @@ export class LocalProvisioner {
       // 面板据此给出**不同**的修法，而不是一律「等 NS 生效」。
       zone: s.zone ?? this._zone ?? null,
       warning: dnsWarningFor(s),
+      credentials,
       createdAt: s.createdAt ?? null,
       updatedAt: s.updatedAt ?? null,
     };
@@ -263,8 +343,11 @@ export class LocalProvisioner {
    * 于是 NS 改好了也永远停在「解析异常」，只能删状态文件才恢复（自锁死）。
    */
   async recheckDns() {
+    // 顺手强制刷一次凭据预检：用户改完账号跑 login 后，面板点「重新检测」就应
+    // 立刻看到结论变化（cert.pem 指纹变了会自动失效缓存，这里再加一层强制）。
+    const credentials = await this.checkCredentials({ force: true });
     const s = this.state;
-    if (!s?.hostname) return { provisioned: false, ok: false, tampered: false, warning: null, publicNs: [], zone: null };
+    if (!s?.hostname) return { provisioned: false, ok: false, tampered: false, warning: null, publicNs: [], zone: null, credentials };
     const { verdict, zone } = await this.#evaluate(s.hostname, s.tunnelId);
     const next = {
       ...s,
@@ -285,7 +368,41 @@ export class LocalProvisioner {
       warning: dnsWarningFor(next),
       checkedAt: next.dnsCheckedAt,
       zone,
+      credentials,
     };
+  }
+
+  /**
+   * 清空本机的固定地址状态（面板「重置本机隧道状态」）。
+   *
+   * 用途：状态文件被跨机拷贝、或结构损坏到无法自愈时，给用户一条不用手改文件系统的出路。
+   * 边界（刻意保守）：
+   *   · 只删**本模块自己写的**两个文件（状态 + ingress 配置），不碰 cert.pem；
+   *   · 不删 Cloudflare 上的隧道与 DNS 记录——那是用户账号资产，删了不可恢复；
+   *   · 幂等：反复调用都返回成功，不会因为文件已不在而报错。
+   */
+  async reset() {
+    const removed = [];
+    const targets = [this.stateFile, this.state?.configFile || this.configFile];
+    for (const file of targets) {
+      if (!file) continue;
+      try {
+        if (fs.statSync(file).isFile()) {
+          fs.unlinkSync(file);
+          removed.push(path.basename(file));
+        }
+      } catch {
+        /* 不存在即目标状态 */
+      }
+    }
+    const hadState = Boolean(this.state?.hostname);
+    if (hadState) {
+      this.log(`tunnel 已重置本机固定地址状态（原地址 ${this.state.hostname}，Cloudflare 侧的隧道与记录未删除）`);
+    }
+    this._state = null;
+    this._auth = null;
+    this._zone = null;
+    return { reset: true, hadState, removed, hostname: null, provisioned: false };
   }
 
   async #exec(args) {
@@ -339,9 +456,54 @@ export class LocalProvisioner {
     return list.some((t) => isLiveTunnel(t) && t.id === tunnelId);
   }
 
+  /** 状态里记的地址是否仍属当前域名（运营换 baseDomain 后旧地址要重写）。 */
+  #hostnameBelongs(hostname) {
+    const h = String(hostname || '').toLowerCase();
+    return h.endsWith(`.${this.baseDomain}`) && h.length > this.baseDomain.length + 1;
+  }
+
+  /** 写状态时顺带记下本机身份：下次从别处拷来的状态就能被识别出来。 */
+  #withMachine(state) {
+    const m = this.machine;
+    if (!m) return state;
+    const prev = state?.machine;
+    if (prev?.id === m.id && prev?.hostname === m.hostname) return state;
+    return { ...state, machine: { id: m.id, hostname: m.hostname } };
+  }
+
   async ensure({ port, force = false } = {}) {
     if (!Number.isInteger(port) || port <= 0) throw fail(4400, '开通隧道需要有效端口');
-    // 授权账号可能变过（域名迁到另一个 Cloudflare 账号后重新 login 就是这种情况）：
+    const account = readZoneCert({ homeDir: this.homeDir })?.accountId || null;
+    // 记下进入本次调用前的地址：跨机状态/凭据缺失会把 cached 清空，
+    // 用这个变量才能如实回答「地址有没有变」（changed 供调用方记日志/判断漂移）。
+    const previousHostname = this.state?.hostname || null;
+    let cached = this.state;
+    let rebuild = false;
+
+    // ── 0) 状态归属校验（跨机拷贝是「分发后分配不出地址」的第二大来源）──
+    //   · machine.id 不是本机 → 整份作废，重新分配地址（不能对外宣称别人的地址）；
+    //   · tunnel 凭据文件不在了 → 状态在本机跑不起来，同样重新分配。
+    if (cached && isForeignState(cached, this.machine)) {
+      this.log(`tunnel 状态来自另一台电脑（${String(cached.machine?.id || '').slice(0, 8)}… ≠ ${String(this.machine?.id || '').slice(0, 8)}…），重新分配固定地址`);
+      cached = null;
+    } else if (cached?.tunnelId && !hasLocalCredentials(cached)) {
+      this.log('tunnel 状态里的 tunnel 凭据文件已不存在，重新分配固定地址');
+      cached = null;
+    }
+
+    // 域名变更（运营换 baseDomain）：子域可沿用，但要按新域名重写地址与记录
+    if (cached?.hostname && !this.#hostnameBelongs(cached.hostname)) {
+      if (cached.subdomain && isValidLabel(cached.subdomain)) {
+        this.log(`tunnel 记录的地址 ${cached.hostname} 不属于当前域名 ${this.baseDomain}，按原前缀重写`);
+        cached = { ...cached, hostname: `${cached.subdomain}.${this.baseDomain}`, dnsOk: null, zone: null };
+        rebuild = true;
+      } else {
+        this.log('tunnel 记录的地址与当前域名不符且前缀不可用，重新分配');
+        cached = null;
+      }
+    }
+
+    // ── 1) 账号可能变过（域名迁到另一个 Cloudflare 账号后重新 login 就是这种情况）──
     // 旧 tunnel 属于上一个账号，继续拿它的 id 去 route dns 只会得到 "tunnel not found"，
     // 或者更糟——静默写不进去却以为自己开通成功。真判定有两条线：
     //   1) 状态文件记了 account 且与当前 cert 不一致 → 确知换了账号；
@@ -350,9 +512,6 @@ export class LocalProvisioner {
     // 注意线 2) 只在「不知道归属」时才走：两种情况都清楚了还去拉子进程，会让面板每次
     // 点开通都多几百毫秒（tunnel-named 里「重复开通不再调 CLI」这条契约就是拦这个的）。
     // 账号变了就当新装：重建隧道、保留同一个子域（地址不变，用户不用重新记/重新扫码）。
-    const account = readZoneCert({ homeDir: this.homeDir })?.accountId || null;
-    let cached = this.state;
-    let rebuild = false;
     if (cached?.tunnelId) {
       const knownMismatch = Boolean(cached.account && account && cached.account !== account);
       // 只有「当前证书能读出账号，但状态文件没记」才算归属未知。反过来若连证书都解析
@@ -381,23 +540,29 @@ export class LocalProvisioner {
         // 校验通过：把归属记下来。否则每次开通都因为「不知道归谁」再问一遍 Cloudflare，
         // 白白多一个子进程的延迟（这条路径就是给老状态文件补账的）。
         cached = { ...cached, account };
-        this._state = cached;
-        writeState(this.stateFile, cached);
+        this._state = this.#withMachine(cached);
+        writeState(this.stateFile, this._state);
       }
     }
     // 走完整开通：缓存里的 port/hostname 看着都可用，但它们描述的是上一个账号的隧道，
     // 跳过缓存才不会「解析通了就以为没事」。
     if (!force && !rebuild && cached?.hostname && cached.port === port) {
+      // 老状态文件没有 machine 字段：命中缓存时顺手认领（一次性，之后就是本机状态）
+      if (!cached.machine && this.machine) {
+        cached = this.#withMachine(cached);
+        this._state = cached;
+        writeState(this.stateFile, cached);
+      }
       // 与 BaseProvisioner 同策略：没确认过就现场验一次（含防篡改评估）
       if (cached.dnsOk !== true) {
         const { verdict, zone } = await this.#evaluate(cached.hostname, cached.tunnelId);
-        const next = {
+        const next = this.#withMachine({
           ...cached,
           dnsOk: verdict.ok,
           dnsTampered: verdict.tampered,
           dnsCheckedAt: new Date().toISOString(),
           zone,
-        };
+        });
         this._state = next;
         writeState(this.stateFile, next);
         return {
@@ -433,7 +598,7 @@ export class LocalProvisioner {
         hostname: cached.hostname,
         port,
       }), { mode: 0o600 });
-      const next = { ...cached, port, updatedAt: new Date().toISOString() };
+      const next = this.#withMachine({ ...cached, port, updatedAt: new Date().toISOString() });
       this._state = next;
       writeState(this.stateFile, next);
       return {
@@ -447,6 +612,13 @@ export class LocalProvisioner {
       };
     }
 
+    // ── 以下每一步都要写 Cloudflare：先在本地把凭据问清楚 ──
+    // 这一步就是 2026-11-21 事故的正解：跨账号的 cert.pem 能列/建隧道，只有写 DNS 才失败，
+    // 等 CLI 报错时用户已经拿到「隧道正常」的假象。预检把失败提前到**任何写入之前**，
+    // 并直接说清「用哪个账号重跑 login」。网络不可达时结论是 unknown，不拦（降级原则）。
+    const auth = await this.checkCredentials();
+    if (auth.blocking) throw this.#credentialError(auth);
+
     const installationId = cached?.installationId || crypto.randomBytes(16).toString('hex');
     const label = cached?.subdomain || deriveSubdomain(this.seed || installationId, { prefix: this.prefix });
     if (!isValidLabel(label)) throw fail(4400, `派生出的子域不合法：${label}`);
@@ -459,7 +631,23 @@ export class LocalProvisioner {
       if (found) {
         tunnelId = found.id;
       } else {
-        const out = await this.run(['tunnel', 'create', label]);
+        let out;
+        try {
+          out = await this.run(['tunnel', 'create', label]);
+        } catch (err) {
+          // 建隧道也会因为凭据/账号问题失败：同样把真实原因透传出来，不要只留一行命令回显
+          const explained = explainTunnelFailure(err, {
+            baseDomain: this.baseDomain,
+            operation: 'create-tunnel',
+            accountName: auth.accountName || null,
+            exe: this.#exeLabel(),
+          });
+          this.log(`tunnel 创建隧道失败 ${explained.reason} ${explained.message}`);
+          throw fail(4500, explained.message, {
+            detail: explained.detail,
+            reason: explained.reason,
+          });
+        }
         const m = UUID_PATTERN.exec(out);
         if (!m) throw fail(4500, 'cloudflared 没有返回 tunnel id', { detail: String(out).slice(-300) });
         tunnelId = m[1];
@@ -497,8 +685,19 @@ export class LocalProvisioner {
     try {
       await this.run(['tunnel', 'route', 'dns', '--overwrite-dns', label, hostname]);
     } catch (err) {
-      throw fail(4500, `写入 DNS 失败：${String(err.message).split('\n')[0]}`, {
-        detail: '确认 matrixboard.cn 在当前 Cloudflare 账号下，且登录时授权的就是它',
+      // 关键修复：不再 `split('\n')[0]`。真实原因在第二行
+      // （`Failed to add route: code: 10000, reason: Authentication error`），
+      // 旧代码把它丢掉，只留下 `Command failed: …` 的命令回显，患者无从下手。
+      const explained = explainTunnelFailure(err, {
+        baseDomain: this.baseDomain,
+        operation: 'route-dns',
+        accountName: auth.accountName || null,
+        exe: this.#exeLabel(),
+      });
+      this.log(`tunnel 写 DNS 失败 ${explained.reason}${explained.code ? ` code=${explained.code}` : ''} ${explained.message}`);
+      throw fail(4500, explained.message, {
+        detail: explained.detail,
+        reason: explained.reason,
       });
     }
 
@@ -519,7 +718,7 @@ export class LocalProvisioner {
       this.log(`tunnel 警告 固定地址写入成功但公网解析不到 ${hostname}`);
     }
 
-    const next = {
+    const next = this.#withMachine({
       ...cached,
       installationId,
       // 记下这本证书属于哪个 Cloudflare 账号：下次若换了账号，能识别出「旧隧道不再可用」
@@ -536,7 +735,7 @@ export class LocalProvisioner {
       zone,
       createdAt: cached?.createdAt ?? now,
       updatedAt: now,
-    };
+    });
     this._state = next;
     writeState(this.stateFile, next);
     this.log(`tunnel 固定地址就绪 ${hostname}（${created ? '新建' : '复用'}，本地管理型）`);
@@ -545,16 +744,140 @@ export class LocalProvisioner {
       url: `https://${hostname}`,
       tunnelId,
       created,
-      changed: Boolean(cached && cached.hostname !== hostname),
+      changed: Boolean(previousHostname && previousHostname !== hostname),
       dnsOk: verdict.ok,
       zone,
       warning,
     };
   }
 
+  /** 面板/报错里展示用的 cloudflared 名字（找不到时退回配置值，不发明路径）。 */
+  #exeLabel() {
+    return findCloudflared(this.executable, this.env) || findCloudflared('auto', this.env) || this.executable;
+  }
+
   async credential({ port }) {
     await this.ensure({ port });
     if (!this.state?.configFile) throw fail(4500, '隧道配置缺失，请重新开通固定地址');
     return { hostname: this.state.hostname, configFile: this.state.configFile };
+  }
+}
+
+/**
+ * 只读本地状态的开通器（cert.pem 不在了 / 被删了也能继续用固定地址）。
+ *
+ * 为什么需要：本地管理型的 ingress 与 tunnel 凭据（<uuid>.json）都在本机，
+ * 日常启动**不需要** zone 凭据——cert.pem 只在开通时用来写 DNS。
+ * 早先这种情况会掉回 Quick Tunnel（随机地址），用户会以为「固定地址丢了」。
+ *
+ * 边界：
+ *   · 绝不写 DNS、绝不建隧道（没有 zone 凭据，做不到也不该假装做到）；
+ *   · 端口变了只重写本地 ingress（纯本地操作，安全）；
+ *   · 状态必须属于本机、凭据文件必须存在，否则 configured=false（不冒充别人的地址）。
+ */
+export class LocalStateProvisioner {
+  constructor({ stateFile = null, configFile = null, baseDomain = 'matrixboard.cn', log = () => {}, homeDir = os.homedir() } = {}) {
+    this.stateFile = stateFile;
+    this.configFile = configFile || (stateFile ? path.join(path.dirname(stateFile), 'tunnel-config.yml') : null);
+    this.baseDomain = String(baseDomain || '').replace(/^\./, '').toLowerCase();
+    this.log = log;
+    this.homeDir = homeDir;
+    this._state = undefined;
+  }
+
+  get kind() {
+    return 'state';
+  }
+
+  get state() {
+    if (this._state === undefined) this._state = readState(this.stateFile, this.log);
+    return this._state;
+  }
+
+  get configured() {
+    const s = this.state;
+    if (!s?.hostname || !s.configFile || !s.credentialsFile) return false;
+    if (isForeignState(s, machineIdentity({ stateFile: this.stateFile }))) return false;
+    if (!fs.existsSync(s.configFile)) return false;
+    return hasLocalCredentials(s);
+  }
+
+  get credentials() {
+    return null;
+  }
+
+  /** 没有 cert.pem 也就没有写入能力：这里只保证「能起隧道」。 */
+  async ensure({ port } = {}) {
+    const s = this.state;
+    if (!s?.hostname || !s.configFile) throw fail(4021, '这台主机还没有可复用的固定地址');
+    if (Number.isInteger(port) && port > 0 && port !== s.port) {
+      try {
+        fs.mkdirSync(path.dirname(s.configFile), { recursive: true, mode: 0o700 });
+        fs.writeFileSync(s.configFile, renderConfig({
+          tunnelId: s.tunnelId,
+          credentialsFile: s.credentialsFile,
+          hostname: s.hostname,
+          port,
+        }), { mode: 0o600 });
+        const next = { ...s, port, updatedAt: new Date().toISOString() };
+        this._state = next;
+        writeState(this.stateFile, next);
+        this.log(`tunnel 端口顺延 ${s.port} → ${port}（本地 ingress 已重写，DNS 未改动）`);
+      } catch (err) {
+        this.log(`tunnel 重写 ingress 失败：${err.message}`);
+      }
+    }
+    return {
+      hostname: s.hostname,
+      url: `https://${s.hostname}`,
+      tunnelId: s.tunnelId,
+      created: false,
+      changed: false,
+      dnsOk: s.dnsOk ?? null,
+      warning: dnsWarningFor(s),
+    };
+  }
+
+  async credential({ port } = {}) {
+    const r = await this.ensure({ port });
+    return { hostname: r.hostname, configFile: this.state?.configFile };
+  }
+
+  /** 与 LocalProvisioner.reset 同语义：只清本机状态与 ingress，不碰 Cloudflare 侧。 */
+  async reset() {
+    const removed = [];
+    const hadState = Boolean(this.state?.hostname);
+    for (const file of [this.stateFile, this.state?.configFile || this.configFile]) {
+      if (!file) continue;
+      try {
+        if (fs.statSync(file).isFile()) {
+          fs.unlinkSync(file);
+          removed.push(path.basename(file));
+        }
+      } catch { /* 不存在即目标状态 */ }
+    }
+    if (hadState) this.log('tunnel 已重置本机固定地址状态（Cloudflare 侧的隧道与记录未删除）');
+    this._state = null;
+    return { reset: true, hadState, removed, hostname: null, provisioned: false };
+  }
+
+  status() {
+    const s = this.state;
+    if (!s) return { kind: 'state', provisioned: false, hostname: null, url: null, tunnelId: null };
+    return {
+      kind: 'state',
+      provisioned: true,
+      hostname: s.hostname,
+      url: `https://${s.hostname}`,
+      tunnelId: s.tunnelId,
+      port: s.port ?? null,
+      dnsOk: s.dnsOk ?? null,
+      dnsCheckedAt: s.dnsCheckedAt ?? null,
+      zone: s.zone ?? null,
+      warning: dnsWarningFor(s),
+      credentials: null,
+      createdAt: s.createdAt ?? null,
+      updatedAt: s.updatedAt ?? null,
+    };
   }
 }

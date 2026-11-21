@@ -97,6 +97,8 @@ dsh plugin --profile desktop add /path/to/dsh-mobile-ios
 | banner 状态点红色 | 网关未起或端口被占——插件自动顺延 3082–3085，重启 DSH 再试 |
 | 手机「需要重新配对」 | 设备被电脑端撤销或凭证过期；手机端「重新配对」不清本地历史 |
 | 隧道地址变了 | Quick Tunnel 重启后域名会变（网关会广播 `addr_changed`），手机端用新地址重配对 |
+| 提示「登录的 Cloudflare 账号不对」 | 本机 `~/.cloudflared/cert.pem` 不是持有该域名那个账号签发的：在终端执行 `cloudflared tunnel login`，浏览器里选**持有该域名**的账号授权，再回面板点「重新检测」。重装插件 / 重启宿主 / 改 NS 都无效 |
+| 固定地址忽然变成另一个前缀 | 本机状态被重置或来自另一台电脑（`tunnel-credentials.mjs` 的 machine 归属校验会拒绝冒充）。点「开启远程」重新分配，或先「重置本机状态」 |
 
 ## 兼容性
 
@@ -266,6 +268,10 @@ bash spike0/run-demo.sh            # 自动起服务 → 造 3 帧 → 跑客户
 | `GET /mobile/v1/tunnel` | 状态。`executable: missing` 表示主机未装 cloudflared，客户端应**隐藏**入口 |
 | `POST /mobile/v1/tunnel/start` | 启动，幂等。地址漂移时向在线会话广播 `gateway{event:"addr_changed"}` |
 | `POST /mobile/v1/tunnel/stop` | 关闭并回收子进程（网关退出时也会收，不留孤儿） |
+| `POST /mobile/v1/tunnel/provision` | 开通固定地址（幂等）。写 DNS 前先做凭据预检，见 9.1 |
+| `POST /mobile/v1/tunnel/recheck-dns` | 强制重探解析 + 强制刷新凭据预检（解开「解析异常」自锁死） |
+| `POST /mobile/v1/tunnel/reset` | 清本机固定地址状态与 ingress（不碰 cert.pem、不删云端隧道），幂等 |
+| `POST /mobile/v1/tunnel/install-cloudflared` | 用户同意后从官方源自举安装 cloudflared 到私有目录 |
 | `GET /mobile/v1/diag/bundle` | 脱敏诊断包，含可直接粘贴的 `text` 字段 |
 
 三条硬约束：
@@ -274,6 +280,27 @@ bash spike0/run-demo.sh            # 自动起服务 → 造 3 帧 → 跑客户
 2. **地址漂移必须广播**：Quick Tunnel 重启后域名会变，不推 `addr_changed` 客户端会一直连旧域名。
    `lastUrl` 跨 stop/start 保留，正是为了检测这种真实漂移。
 3. **诊断包不外发隐私**：不含设备 token、绝对路径、prompt 正文、产物内容（`test/ops.mjs` 有对应断言）。
+
+### 9.1 固定地址开通：换台电脑也必须能自证
+
+分发到另一台电脑后「分配不出固定地址」的根因不是网络，而是**本机凭据与状态的归属**。
+这条链路上有五条不可放松的规则（对应 `test/tunnel-credentials.mjs`）：
+
+| 规则 | 实现 | 为什么 |
+|---|---|---|
+| 开通前预检 cert 的可用性 | `zone-health.verifyCertAccess` | 跨账号的 cert 能列/建隧道、只有写 DNS 会失败；等 CLI 报错时用户已拿到「隧道正常」的假象 |
+| 预检只在**确定**不可用时拦人 | `blocking` 状态集 | 断网/证书格式不认识 → `unknown`，不能因此判死一台本来能用的机器 |
+| 失败信息保留 `code/reason` | `tunnel-error.explainTunnelFailure` | 旧实现 `split('\n')[0]` 把 `code: 10000, Authentication error` 丢掉，只剩命令回显 |
+| 状态带机器归属 | `tunnel-state.machineIdentity` + `isForeignState` | 整份 `~/.dsh` 被拷到新机器时，旧地址指向旧机器；新机器绝不能冒充 |
+| 没有 cert.pem 也能起隧道 | `LocalStateProvisioner` | 本地 ingress 与 tunnel 凭据都在本机，日常启动不需要 zone 凭据；端口顺延只重写本地配置 |
+
+诊断矩阵（`TunnelStatus.credentials.state`）：`ok` / `missing`（没有 cert） / `unreadable`（解析不了，降级）
+/ `no-token`（旧版证书，降级） / `forbidden`（403） / `zone-missing`（这账号看不到域名） /
+`account-mismatch`（证书账号 ≠ zone 账号） / `stale-zone`（证书指向已被重建的 zone） /
+`zone-moved`（域名被另一账号接管） / `unknown`（网络不可达）。
+
+唯一正确的修法只有一个：**用持有该域名的账号重跑 `cloudflared tunnel login`**。
+换账号后 `ensure()` 会自动识别账号变更、重建隧道并**沿用同一个子域**（地址不变、无需重新配对）。
 
 ## 10. 下一步
 

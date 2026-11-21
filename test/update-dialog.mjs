@@ -83,6 +83,7 @@ const { showUpdateModal, closeUpdateModal, copyToClipboard } = exports.__test;
 const { performUpdate, setPluginManager, setUpdateTimeout, isUpdateInFlight, unwrapRemote } = exports.__test;
 const { restorePendingUpdate, readUpdateState, writeUpdateState, clearUpdateState } = exports.__test;
 const { probe, showDnsHelpModal, copyToClipboard: copyFn, offerManualCopy, showModalToast } = exports.__test;
+const { showCredentialHelpModal, confirmResetTunnelState } = exports.__test;
 check('测试钩子导出跨重载恢复函数', typeof restorePendingUpdate === 'function' && typeof writeUpdateState === 'function');
 check('测试钩子导出对话框函数', typeof showUpdateModal === 'function' && typeof closeUpdateModal === 'function');
 check('测试钩子导出一步更新函数', typeof performUpdate === 'function' && typeof setPluginManager === 'function' && typeof isUpdateInFlight === 'function');
@@ -95,6 +96,12 @@ function findByText(el, text, out = []) {
 function allButtons(el, out = []) {
   if (el.tagName === 'BUTTON') out.push(el);
   for (const c of el.children || []) allButtons(c, out);
+  return out;
+}
+/** 长文案用包含匹配：断言目的是「这句话在不在」，不是把整句抄进测试。 */
+function containsText(el, text, out = []) {
+  if (String(el._text || '').includes(text)) out.push(el);
+  for (const c of el.children || []) containsText(c, text, out);
   return out;
 }
 function lastModal() { return body.children[body.children.length - 1]; }
@@ -399,6 +406,39 @@ showDnsHelpModal({ ok: false, tampered: true });
 modal = lastModal();
 check('改指时标题为「固定域名被改指」', findByText(modal, '固定域名被改指').length > 0);
 check('改指时提示网关拒绝下发', findByText(modal, '⚠️ CNAME 已不指向本机隧道').length > 0);
+closeUpdateModal();
+
+// 凭据不可用（跨账号证书）：2026-11-21 现场。用户只看到一句 cloudflared 命令回显，
+// 以为插件坏了。这里锁住「给出唯一正确的动作：用对的账号 login」。
+showCredentialHelpModal({
+  state: 'zone-missing',
+  blocking: true,
+  hint: '当前登录的账号里看不到这个域名',
+  accountName: "815353729@qq.com's Account",
+  zoneName: 'matrixboard.cn',
+  zoneStatus: 'active',
+});
+modal = lastModal();
+check('凭据弹窗标题点明账号不对', findByText(modal, '登录的 Cloudflare 账号不对').length > 0);
+check('凭据弹窗横幅直接用预检结论', findByText(modal, '⚠️ 当前登录的账号里看不到这个域名').length > 0);
+check('凭据弹窗列出当前证书账号（点破是哪个账号）', findByText(modal, "815353729@qq.com's Account").length > 0);
+check('凭据弹窗给出 tunnel login 命令', containsText(modal, 'cloudflared tunnel login').length > 0);
+check('凭据弹窗说明面板无法代做浏览器授权', containsText(modal, '面板无法代做浏览器授权').length > 0);
+check('凭据弹窗有「重新检测」出口（login 后不用重启插件）',
+  allButtons(modal).some((b) => b._text === '重新检测'));
+check('凭据弹窗有「重置本机状态」兜底（跨机拷贝场景）',
+  allButtons(modal).some((b) => b._text === '重置本机状态'));
+closeUpdateModal();
+
+// 重置是「清本机状态」：必须二次确认，且讲清不动云端
+confirmResetTunnelState();
+modal = lastModal();
+check('重置前有二次确认', findByText(modal, '重置本机固定地址状态').length > 0);
+check('确认框标明只清本机、不动 Cloudflare', findByText(modal, '⚠️ 只清本机状态，不动 Cloudflare').length > 0);
+check('确认框说明不删 cert.pem 与云端记录',
+  containsText(modal, '不删除 ~/.cloudflared/cert.pem').length > 0);
+check('确认框有「确认重置」与「取消」',
+  allButtons(modal).some((b) => b._text === '确认重置') && allButtons(modal).some((b) => b._text === '取消'));
 closeUpdateModal();
 
 console.log(`\n结果：${pass} 通过 / ${failures.length} 失败`);

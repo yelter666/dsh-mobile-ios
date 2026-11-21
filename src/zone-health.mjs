@@ -243,6 +243,185 @@ export function cnameBelongsTo(content, tunnelId) {
   return String(content).toLowerCase().startsWith(String(tunnelId).toLowerCase());
 }
 
+/**
+ * 凭据状态码 → 面板一句话。blocking 的几种都是**确定不可用**，
+ * 其余（unknown / unreadable / no-token）只表示「查不清」，绝不能据此拦人。
+ */
+export const CREDENTIAL_STATE_HINT = {
+  ok: '登录的 Cloudflare 账号可以管理这个域名',
+  missing: '主机还没有登录 Cloudflare',
+  unreadable: 'cert.pem 无法解析（可能是旧格式或文件损坏）',
+  'no-token': 'cert.pem 里没有可用的 zone token（旧版证书）',
+  forbidden: '登录的 Cloudflare 账号没有这个域名的权限',
+  'zone-missing': '当前登录的账号里看不到这个域名',
+  'account-mismatch': '证书所属账号与域名所在账号不是同一个',
+  'stale-zone': 'cert.pem 指向的 zone 已失效（域名可能被删后重新接入）',
+  'zone-moved': '域名已被另一个 Cloudflare 账号接管',
+  unknown: '暂时查不到凭据的可用性（网络不可达）',
+};
+
+/** 这些状态是「确定不可用」：可以放心在写 DNS 之前拦下，并给出对应修法。 */
+const BLOCKING_STATES = new Set(['missing', 'forbidden', 'zone-missing', 'account-mismatch', 'stale-zone', 'zone-moved']);
+
+/**
+ * 带 HTTP 状态的只读请求（cfGet 只关心 result，这里需要区分 403 与「断网」）。
+ * 任何异常都收敛成一个对象，绝不抛。
+ */
+async function cfRequest(apiBase, apiToken, pathname, fetchImpl, timeoutMs = 4000) {
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  try {
+    const res = await fetchImpl(`${apiBase}${pathname}`, {
+      headers: { Authorization: `Bearer ${apiToken}` },
+      ...(controller ? { signal: controller.signal } : {}),
+    });
+    const text = await res.text();
+    let payload = null;
+    try { payload = text ? JSON.parse(text) : null; } catch { payload = null; }
+    return {
+      status: res.status,
+      ok: Boolean(res.ok),
+      success: payload?.success === true,
+      result: payload?.result ?? null,
+      errors: payload?.errors ?? [],
+      reached: true,
+    };
+  } catch (err) {
+    return { status: 0, ok: false, success: false, result: null, errors: [], reached: false, error: err?.message || String(err) };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * 开通前凭据预检：**这本 cert.pem 能不能写这个域名的 DNS**。
+ *
+ * 为什么必须在写 DNS 之前问：cross-account 的证书能列隧道、能建隧道（账号级权限正常），
+ * 只有写 DNS 会失败。等 CLI 报错时，用户已经拿到一个「隧道正常」的假象，
+ * 而错误又被截断成一行命令回显——这正是 2026-11-21 的现场。
+ *
+ * 判定口径（宁可放过，不可误杀）：
+ *   · 403 / success:false            → 确定无权限（forbidden）
+ *   · 200 且 zone 列表为空            → 这个 token 看不到该域名（zone-missing）
+ *   · zone.account 与证书 account 不同 → account-mismatch
+ *   · zone.id 与证书 zoneID 不同       → 证书指向旧 zone（stale-zone）
+ *   · zone.status = moved             → 域名被另一账号接管（zone-moved）
+ *   · 断网/超时/无 token/解析失败      → unknown（不拦，交给 CLI 报错兜底）
+ *
+ * @returns {Promise<{state: string, blocking: boolean, hint: string|null,
+ *   accountName: string|null, zoneName: string|null, zoneStatus: string|null,
+ *   certAccountId: string|null, zoneId: string|null, detail: string|null}>}
+ */
+export async function verifyCertAccess({
+  homeDir = os.homedir(),
+  baseDomain,
+  fetchImpl = globalThis.fetch,
+  apiBase = CF_API_BASE,
+  timeoutMs = 4000,
+} = {}) {
+  const base = {
+    state: 'unknown',
+    blocking: false,
+    hint: CREDENTIAL_STATE_HINT.unknown,
+    accountName: null,
+    zoneName: baseDomain || null,
+    zoneStatus: null,
+    certAccountId: null,
+    zoneId: null,
+    detail: null,
+  };
+  const certFile = path.join(homeDir, '.cloudflared', 'cert.pem');
+  if (!fs.existsSync(certFile)) {
+    return { ...base, state: 'missing', blocking: true, hint: CREDENTIAL_STATE_HINT.missing, detail: '没有找到 cert.pem' };
+  }
+  if (typeof fetchImpl !== 'function') return { ...base, detail: '当前运行时不支持网络请求' };
+
+  const cert = readZoneCert({ homeDir });
+  if (!cert) {
+    return { ...base, state: 'unreadable', blocking: false, hint: CREDENTIAL_STATE_HINT.unreadable, detail: 'cert.pem 结构无法解析' };
+  }
+  if (!cert.apiToken) {
+    return {
+      ...base,
+      state: 'no-token',
+      blocking: false,
+      hint: CREDENTIAL_STATE_HINT['no-token'],
+      certAccountId: cert.accountId || null,
+      detail: '证书里没有 apiToken，无法预检',
+    };
+  }
+  if (!baseDomain) return { ...base, detail: '未配置固定地址域名' };
+
+  const list = await cfRequest(apiBase, cert.apiToken, `/zones?name=${encodeURIComponent(baseDomain)}`, fetchImpl, timeoutMs);
+  if (!list.reached) return { ...base, certAccountId: cert.accountId || null, detail: list.error || null };
+  if (!list.ok || !list.success) {
+    // 403 是确定无权限；其余 4xx/5xx 说不清，交给 CLI
+    if (list.status === 403 || list.status === 401) {
+      return {
+        ...base,
+        state: 'forbidden',
+        blocking: true,
+        hint: CREDENTIAL_STATE_HINT.forbidden,
+        certAccountId: cert.accountId || null,
+        detail: `HTTP ${list.status}`,
+      };
+    }
+    return { ...base, certAccountId: cert.accountId || null, detail: `HTTP ${list.status}` };
+  }
+
+  const zones = Array.isArray(list.result) ? list.result : [];
+  const zone = zones.find((z) => z && String(z.name).toLowerCase() === baseDomain.toLowerCase()) || null;
+  if (!zone) {
+    // 空列表 = 这个 token 看不到该域名（zone 范围的 token 只列得出自己那把 zone）
+    return {
+      ...base,
+      state: 'zone-missing',
+      blocking: true,
+      hint: CREDENTIAL_STATE_HINT['zone-missing'],
+      certAccountId: cert.accountId || null,
+      detail: `证书指向 zone ${String(cert.zoneId || '未知').slice(0, 8)}…，但它已不在任何可访问的 ${baseDomain} 之下`,
+    };
+  }
+
+  const zoneAccountId = zone.account?.id || null;
+  const accountMismatch = Boolean(cert.accountId && zoneAccountId && cert.accountId !== zoneAccountId);
+  const staleZone = Boolean(cert.zoneId && zone.id && cert.zoneId !== zone.id);
+  let accountName = null;
+  if (zoneAccountId) {
+    const acc = await cfRequest(apiBase, cert.apiToken, `/accounts/${zoneAccountId}`, fetchImpl, timeoutMs);
+    if (acc.ok && acc.success) accountName = acc.result?.name || null;
+  }
+  const common = {
+    ...base,
+    accountName,
+    zoneName: zone.name || baseDomain,
+    zoneStatus: zone.status || null,
+    certAccountId: cert.accountId || null,
+    zoneId: zone.id || null,
+  };
+  if (accountMismatch) {
+    return {
+      ...common,
+      state: 'account-mismatch',
+      blocking: true,
+      hint: CREDENTIAL_STATE_HINT['account-mismatch'],
+      detail: `证书账号 ${String(cert.accountId).slice(0, 8)}…，域名归属 ${String(zoneAccountId).slice(0, 8)}…`,
+    };
+  }
+  if (staleZone) {
+    return { ...common, state: 'stale-zone', blocking: true, hint: CREDENTIAL_STATE_HINT['stale-zone'] };
+  }
+  if (zone.status === 'moved') {
+    return { ...common, state: 'zone-moved', blocking: true, hint: CREDENTIAL_STATE_HINT['zone-moved'] };
+  }
+  return { ...common, state: 'ok', blocking: false, hint: CREDENTIAL_STATE_HINT.ok };
+}
+
+/** 预检结论 → 是否阻断（供不关心细节的调用方使用）。 */
+export function isCredentialBlocking(verdict) {
+  return Boolean(verdict && BLOCKING_STATES.has(verdict.state));
+}
+
 /** 稳定摘要，用于把「同一份 zone」与「另一份 zone」区分开（不写 ID，只做等值比较）。 */
 export function zoneFingerprint(zone) {
   const src = `${zone?.accountId || ''}|${zone?.zoneId || ''}|${zone?.zoneName || ''}`;

@@ -5,7 +5,6 @@
 //   3. 宿主卸载插件时必须彻底释放 socket / 定时器，不留孤儿监听。
 
 import os from 'node:os';
-import fs from 'node:fs';
 import path from 'node:path';
 import { createGateway } from '../src/server.mjs';
 import { createFileLog } from '../src/file-log.mjs';
@@ -13,7 +12,7 @@ import { findCloudflared, sweepOrphanTunnels } from '../src/tunnel.mjs';
 import { createMockHost } from '../src/adapter/mock-host.mjs';
 import { createMuxHost } from '../src/adapter/mux-host.mjs';
 import { createCordisHost } from '../src/adapter/cordis-host.mjs';
-import { createProvisioner } from '../src/cloudflare.mjs';
+import { resolveProvisioner, defaultTunnelStateFile } from '../src/provision-select.mjs';
 import { PLUGIN_VERSION } from '../src/version.mjs';
 
 export const name = 'dsh-mobile-ios';
@@ -95,62 +94,37 @@ export function apply(ctx = {}, config = {}) {
       .catch(() => { /* 清扫失败不挡启动 */ });
 
     /**
-     * Pro 固定地址开通器。按「已经能用的证据」排序，谁先齐备用谁：
+     * Pro 固定地址开通器。判定统一在 resolveProvisioner（与 sidecar 同一套顺序）：
      *   1. config.tunnel.provisioner（显式指定，尊重运营决定）
-     *   2. Cloudflare API（config 或 env 里有 accountId + apiToken）
-     *   3. 开通服务（endpoint + enrollToken，产品形态；zone 权限留在服务端）
+     *   2. 开通服务（endpoint + enrollToken，产品形态；zone 权限留在服务端）
+     *   3. Cloudflare API（config 或 env 里有 accountId + apiToken）
      *   4. 本地管理型（~/.cloudflared/cert.pem 存在，说明跑过 tunnel login）
-     *   5. 只读状态（以前开通过，日常启动不该再要 zone 凭据）
+     *   5. 只读状态（以前开通过，日常启动不该再要 zone 凭据；token 或本地 ingress 两种形态）
      * 都没有就保持 Quick Tunnel——免费层行为一字不改。
+     *
+     * 两个入口共用同一个判定，是为了避免「同一台机器换个启动方式就换一种结论」：
+     * 那会让固定地址时有时无，用户只会觉得插件坏了。
      */
     const tunnelCfg = config.tunnel || {};
-    const tunnelStateFile = tunnelCfg.stateFile || path.join(os.homedir(), '.dsh', 'mobile-access', 'tunnel-named.json');
-    const baseDomain = tunnelCfg.baseDomain || process.env.DSH_TUNNEL_BASE_DOMAIN || 'matrixboard.cn';
+    const tunnelStateFile = tunnelCfg.stateFile || defaultTunnelStateFile();
     const cloudflareBin = resolveCloudflared(config);
-    const common = {
-      baseDomain,
-      prefix: tunnelCfg.prefix || 'dsh',
-      // 没找到就留 'auto'：让发现链在真正要用的那一刻再解析一次（自动安装发生在启动之后）
-      executable: cloudflareBin,
-    };
-    const explicit = tunnelCfg.provisioner ? String(tunnelCfg.provisioner) : null;
-    const apiToken = tunnelCfg.apiToken || process.env.DSH_CF_API_TOKEN;
-    const accountId = tunnelCfg.accountId || process.env.DSH_CF_ACCOUNT_ID;
-    const endpoint = tunnelCfg.endpoint || process.env.DSH_TUNNEL_ENDPOINT;
 
-    let provisioner = null;
-    if (explicit === 'state') {
-      provisioner = createProvisioner({ ...common, provisioner: 'state' }, { log, stateFile: tunnelStateFile });
-      if (provisioner && !provisioner.configured) provisioner = null;
-    } else if (explicit === 'local') {
-      provisioner = createProvisioner({ ...common, provisioner: 'local' }, { log, stateFile: tunnelStateFile });
-      if (provisioner && !provisioner.configured) provisioner = null;
-    } else if (explicit === 'hosted' || (!explicit && endpoint)) {
-      provisioner = createProvisioner(
-        { ...common, provisioner: 'hosted', endpoint, enrollToken: tunnelCfg.enrollToken || process.env.DSH_TUNNEL_ENROLL_TOKEN },
-        { log, stateFile: tunnelStateFile, hostId: 'host_cordis' },
-      );
-    } else {
-      provisioner = createProvisioner(
-        { ...common, provisioner: 'cloudflare', apiToken, accountId, zoneId: tunnelCfg.zoneId || process.env.DSH_CF_ZONE_ID },
-        { log, stateFile: tunnelStateFile },
-      );
-      if (!provisioner) {
-        const local = createProvisioner({ ...common, provisioner: 'local' }, { log, stateFile: tunnelStateFile });
-        if (local?.configured) provisioner = local;
-      }
-    }
-
-    // 没有开通凭据，但这台机器以前开通过：用只读状态继续跑固定地址。
-    // 日常启动不该依赖 zone 级凭据——token 就在 0600 状态文件里。
-    if (!provisioner && fs.existsSync(tunnelStateFile)) {
-      const fromState = createProvisioner({ provisioner: 'state', baseDomain }, { log, stateFile: tunnelStateFile });
-      if (fromState?.configured) {
-        provisioner = fromState;
-        log('tunnel 复用已开通的固定地址（只读状态，无 zone 凭据）');
-      }
-    }
-    if (provisioner) log(`tunnel 固定地址开通器=${provisioner.kind} 域名=${provisioner.baseDomain}`);
+    const provisioner = resolveProvisioner({
+      tunnelCfg: {
+        ...tunnelCfg,
+        // 环境变量兜底：与 sidecar 一致，避免只在某个入口生效
+        apiToken: tunnelCfg.apiToken || process.env.DSH_CF_API_TOKEN,
+        accountId: tunnelCfg.accountId || process.env.DSH_CF_ACCOUNT_ID,
+        zoneId: tunnelCfg.zoneId || process.env.DSH_CF_ZONE_ID,
+        endpoint: tunnelCfg.endpoint || process.env.DSH_TUNNEL_ENDPOINT,
+        enrollToken: tunnelCfg.enrollToken || process.env.DSH_TUNNEL_ENROLL_TOKEN,
+        baseDomain: tunnelCfg.baseDomain || process.env.DSH_TUNNEL_BASE_DOMAIN || 'matrixboard.cn',
+        executable: cloudflareBin,
+      },
+      stateFile: tunnelStateFile,
+      hostId: 'host_cordis',
+      log,
+    });
 
     const booting = createGateway({
       host,

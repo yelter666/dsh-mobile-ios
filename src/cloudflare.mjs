@@ -18,12 +18,13 @@
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fail } from './protocol.mjs';
 import { deriveSubdomain, isValidLabel } from './dns-label.mjs';
 import { DNS_PENDING_HINT, DNS_TAMPER_HINT, dnsWarningFor, evaluateDnsAnswer, probeDns } from './dns-probe.mjs';
-import { LocalProvisioner, sanitizeZone } from './provision-local.mjs';
-import { diagnoseZone, findDnsOwner, ZONE_STATUS_HINT } from './zone-health.mjs';
+import { LocalProvisioner, LocalStateProvisioner, sanitizeZone } from './provision-local.mjs';
+import { diagnoseZone, findDnsOwner, verifyCertAccess, ZONE_STATUS_HINT } from './zone-health.mjs';
 
 // 兼容既有调用方与测试：子域规则从 dns-label.mjs 来，这里一并导出
 export { deriveSubdomain, isValidLabel };
@@ -265,6 +266,26 @@ class BaseProvisioner {
 
   get notConfiguredDetail() {
     return null;
+  }
+
+  /** 非本地形态没有 cert.pem 可预检；面板统一按「无凭据信息」处理。 */
+  get credentials() {
+    return null;
+  }
+
+  /** 重置本机状态：token 形态由状态文件承载，删掉即「重新开通」。 */
+  async reset() {
+    let removed = [];
+    try {
+      if (this.stateFile && fs.statSync(this.stateFile).isFile()) {
+        fs.unlinkSync(this.stateFile);
+        removed = [path.basename(this.stateFile)];
+      }
+    } catch { /* 不存在即目标状态 */ }
+    const hadState = Boolean(this.state?.hostname);
+    this._state = null;
+    this._zone = null;
+    return { reset: true, hadState, removed, hostname: null, provisioned: false };
   }
 }
 
@@ -670,18 +691,34 @@ export function createProvisioner(config = {}, { log = () => {}, stateFile = nul
       stateFile,
       configFile: config.configFile || null,
       seed: config.seed || null,
+      // 默认当前用户；显式传入便于测试与「非标准 home」的宿主环境
+      homeDir: config.homeDir || os.homedir(),
       log,
       // 生产路径才接真实探测：测试直接 new LocalProvisioner 时保持零网络依赖
       zoneDiagnose: diagnoseZone,
       ownerLookup: findDnsOwner,
+      // 开通前凭据预检：跨账号的 cert.pem 必须在写 DNS **之前**被识别出来
+      verifyAccess: verifyCertAccess,
+      hostname: os.hostname(),
     });
   }
   if (kind === 'state') {
-    return new StateProvisioner({
+    // 先按 token 形态找；找不到再按**本地管理型**状态找（cert.pem 被删了也能继续用固定地址）。
+    // 返回 null 的语义是「这台机器确实没有可复用的固定地址」，而不是「凭据不全就降级成随机地址」。
+    const byToken = new StateProvisioner({
       stateFile,
       baseDomain: config.baseDomain || 'matrixboard.cn',
       log,
     });
+    if (byToken.configured) return byToken;
+    const byLocal = new LocalStateProvisioner({
+      stateFile,
+      configFile: config.configFile || null,
+      baseDomain: config.baseDomain || 'matrixboard.cn',
+      homeDir: config.homeDir || os.homedir(),
+      log,
+    });
+    return byLocal.configured ? byLocal : null;
   }
   if (kind === 'hosted') {
     const provisioner = new HostedProvisioner({

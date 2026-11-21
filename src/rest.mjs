@@ -101,6 +101,7 @@ const DESKTOP_CORS_PATHS = [
   /^\/mobile\/v1\/tunnel\/provision$/,
   /^\/mobile\/v1\/tunnel\/install-cloudflared$/,
   /^\/mobile\/v1\/tunnel\/recheck-dns$/,
+  /^\/mobile\/v1\/tunnel\/reset$/,
   /^\/mobile\/v1\/plugin\/self-update$/,
 ];
 
@@ -263,6 +264,9 @@ export function createRestRouter({ core, pairing, host, tickets, config = {}, lo
       // 面板据此给**不同**的修法，而不是一律「等 NS 生效」。
       zone: prov?.zone ?? null,
       warning: prov?.warning ?? null,
+      // 凭据预检结论（local 形态才有）：state=障碍类型，blocking=是否**确定**不可写。
+      // 面板因此能在用户点「开启远程」之前就提示「登录的账号不对」，而不是等写 DNS 才崩。
+      credentials: prov?.credentials ?? null,
       // 面板据此决定是否显示「自动安装 cloudflared」入口：仅在缺失且有官方构建时为 true。
       canAutoInstall: base.executable === 'missing' && !!resolveAsset({}),
     };
@@ -570,6 +574,34 @@ export function createRestRouter({ core, pairing, host, tickets, config = {}, lo
       publicNs,
       status: tunnelSnapshot(),
     }, DESKTOP_CORS);
+  });
+
+  /**
+   * 重置本机的固定地址状态（面板兜底动作）。
+   *
+   * 存在的理由：状态文件被跨机拷贝、或损坏到无法自愈时，用户原来只能手删
+   * ~/.dsh/mobile-access/tunnel-named.json——那是「只有开发者才会的操作」。
+   * 这里把「清本地状态」变成一次点击，并明确边界：
+   *   · 只清本机状态与 ingress 配置，**不删** cert.pem；
+   *   · **不删** Cloudflare 上的隧道与 DNS 记录（用户账号资产，删了不可恢复）；
+   *   · 幂等：重复点不会报错。
+   * 回环-only：管理面动作，与开通/启停同一道门。
+   */
+  route('POST', /^\/mobile\/v1\/tunnel\/reset$/, async (ctx) => {
+    loopbackOnly(ctx, '重置固定地址只允许在主机本机操作');
+    const prov = config.tunnelProvisioner;
+    if (typeof prov?.reset !== 'function') {
+      throw fail(4021, '当前主机没有可重置的固定地址状态', { method: 'tunnel.reset' });
+    }
+    // 先停隧道：进程还挂着旧配置时删配置，下一轮重拉会读到一个不存在的 ingress
+    try {
+      await config.tunnel?.stop?.();
+    } catch (err) {
+      log(`rest  tunnel reset 前停止隧道失败（继续重置）${err?.message || err}`);
+    }
+    const result = await prov.reset();
+    log(`rest  tunnel reset 完成 hadState=${result.hadState} removed=${(result.removed || []).join(',') || '（无文件）'}`);
+    return send(ctx.res, 200, { ...result, status: tunnelSnapshot() }, DESKTOP_CORS);
   });
 
   /**
@@ -909,6 +941,9 @@ export function createRestRouter({ core, pairing, host, tickets, config = {}, lo
           code,
           message: err.message || meta.message,
           ...(err.extra?.detail ? { detail: err.extra.detail } : {}),
+          // 机器可读的失败原因（credentials / zone / conflict …）：面板据此决定
+          // 「给登录指引」还是「给 NS 修法」，不靠中文字符串匹配。
+          ...(err.extra?.reason ? { reason: err.extra.reason } : {}),
           traceId,
           ...(err.extra?.retryAfterMs ? { retryAfterMs: err.extra.retryAfterMs } : {}),
           ...(err.extra?.attemptsRemaining !== undefined ? { retryAfterMs: err.extra.retryAfterMs, attemptsRemaining: err.extra.attemptsRemaining } : {}),
